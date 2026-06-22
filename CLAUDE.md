@@ -1,110 +1,180 @@
 # CLAUDE.md
-> The real-time tier of Reprise AI: a `realtime-gateway` (Socket.io fan-out) plus a `transcription-service` (LiveKit to Deepgram), serving as the working guide for AI coding agents in this repo.
 
-## 🎯 Purpose
+This is `reprise-realtime`, the real-time tier of Reprise AI: a Node/Socket.io `realtime-gateway` (WebSocket fan-out) and a Python/FastAPI `transcription-service` (LiveKit audio hook to Deepgram). The single most important thing: these are two services that scale on different signals and stay decoupled, only Deepgram finals persist to `transcript_chunks` (interims never do), and the Deepgram key stays server-side.
 
-`reprise-realtime` is the **real-time tier** of Reprise AI: the WebSocket and streaming layer that transcribes live meetings and fans out live captions, streamed agent output, agent results, and presence to web and mobile clients.
+## Repo at a glance
 
-It scales on concurrent connections and live streams, not on request rate. Specifically, it:
+The real-time tier owns the live path of a Reprise AI meeting: server-side audio capture, Deepgram transcription, and the fan-out of live captions and streamed agent output to the participant's browser or mobile client. It holds the platform's long-lived WebSocket connections and its only live audio proxy.
 
-- Carries no media (LiveKit does).
-- Runs no LLM (the AI tier does).
-- Is not a system of record for agent output (the durable truth lives in `core-api`).
+It contains exactly two services, in two separate containers, because they scale on different and non-interchangeable signals:
 
-Two services live here: a Node `realtime-gateway` (fan-out) and a Python `transcription-service` (Deepgram WS proxy).
+- `realtime-gateway` scales on anchor `A6` = 100,000 concurrent WebSocket connections (one per participant).
+- `transcription-service` scales on anchor `A5` = 20,000 concurrent live streams (one diarized Deepgram session per meeting).
 
-## 🧱 Stack & Layout
+20,000 meetings carry roughly 100,000 connections, so the anchors are not interchangeable. Coupling them in one process would force one to over-provision for the other's load. Separate containers with separate KEDA scalers is the structural fix. Keep them independent: no shared process, no shared in-memory state.
 
-```
-services/realtime-gateway/        # Node + Socket.io + Redis adapter (fan-out plane)
-services/transcription-service/   # Python FastAPI WS proxy -> Deepgram
-proto/                            # shared Avro / event schemas
-libs/                             # shared helpers (tenancy, envelope, Redis keys)
-```
+This tier carries no media (LiveKit's SFU does), mints no LiveKit tokens and takes no LiveKit webhooks (that is `meeting-service` in the control-plane tier), runs no LLM (the AI tier does), and is not the system of record for agent output (durable truth is `agent-results` and confirmed `decisions`/`actions`, owned by `core-api`).
 
-**`realtime-gateway`** (Node + Socket.io)
-- Owns WebSocket connections, Socket.io rooms keyed by `meeting_id`, Redis pub/sub fan-out, and presence.
-- Consumes `agent-stream`, `agent-results`, `notifications`.
-- Produces `presence-events`.
+## Architecture orientation
 
-**`transcription-service`** (Python / FastAPI)
-- Owns the Deepgram proxy and `transcript_chunks`.
-- Consumes `meeting-room-events`.
-- Produces `transcript-chunks`.
+Three WebSocket flows pass through this tier. Socket.io rooms are keyed by `meeting_id` and fanned across instances via the `nexus:{org_id}:pubsub:meeting:{meeting_id}` Redis channel: a connection for a meeting may land on any gateway pod, but a bus event arrives at one pod, so that pod publishes on the channel and every subscribed pod emits to its local sockets in the room.
 
-### Stack & versions
+1. Audio in. The LiveKit server-side audio hook delivers mixed room audio to `transcription-service` over an internal WS. The service opens a single Deepgram WebSocket session per meeting and proxies the audio over WSS, keeping the Deepgram key server-side. Audio never crosses the backend trust boundary to reach Deepgram.
 
-| | `realtime-gateway` | `transcription-service` |
+2. Live captions out. Deepgram interims drive captions immediately (low-latency, mutable, never persisted, never on the bus). Deepgram finals are the durable truth: each is persisted to `transcript_chunks`, produced to the `transcript-chunks` topic, and also emitted as a caption. Captions reach clients through `realtime-gateway` within the budget of p95 < 2 s (Deepgram-bound, no LLM in this path).
+
+3. Agent output out. `agent-stream` token deltas and the final `agent-results` message are consumed from Redpanda by `realtime-gateway` and pushed over WebSocket to the client agent sidebar. Streaming is a UX optimization, never a system of record: a client that misses every delta still gets the final `agent-results` card.
+
+## Service map
+
+| | `realtime-gateway` (Node/Socket.io) | `transcription-service` (Python/FastAPI) |
 |---|---|---|
-| Language | TypeScript, Node 20+ | Python 3.11+ (typed) |
-| Framework | Socket.io (+ Redis adapter) | FastAPI WS proxy |
-| External | Redis Cluster, Redpanda (Kafka API) | Deepgram SDK (WSS), LiveKit audio hook, Redpanda |
-| Lint / format | ESLint + Prettier | ruff + black |
-| Test | Node test runner + WS load/soak | pytest + stream soak |
+| Job | WebSocket fan-out plane for every non-AV signal: captions, agent output, presence, chat, priority alerts | Deepgram WS proxy: server-side audio in, ASR with diarization, interim vs final separation |
+| Scales on | `A6` = 100k concurrent connections | `A5` = 20k concurrent live streams |
+| State | Ephemeral only: connection/presence sets and per-user queue in Redis; nothing durable | Writes only `transcript_chunks` (Postgres); otherwise stateless |
+| Produces | `presence-events` | `transcript-chunks` (only finals, `TranscriptChunk` Avro) |
+| Consumes | `agent-stream`, `agent-results`, `notifications` | `meeting-room-events` (start/stop Deepgram streams on LiveKit lifecycle) |
+| Rooms / keys | Socket.io rooms keyed by `meeting_id`; fan-out via `nexus:{org_id}:pubsub:meeting:{meeting_id}` | One Deepgram session per `meeting_id` |
+| Persists | Nothing durable | One `transcript_chunks` row per final, merged by speaker turn |
 
-## 📐 Conventions
+`transcript_chunks` columns: `org_id`, `meeting_id`, `speaker_id`, `start_ms`, `end_ms`, `text`, `is_final`, `confidence`. The diarized `speaker_id` is emitted as-is; the `speaker_id` to `user_id` mapping is resolved downstream via `meeting_speakers`, never guessed at write time. `transcription-service` does not produce `usage-events`: transcription minutes are metered by `billing-metering-service` in the control-plane tier.
 
-- **Tenancy first.** Every WS handshake, message, Redis key, and produced event carries `org_id`.
-- **Decoupled stacks.** `realtime-gateway` and `transcription-service` scale on different anchors (`A6` connections vs `A5` streams); keep them independent.
-- **Ephemeral by design.** A pod may be lost and replaced with no data loss; durable state lives elsewhere.
-- **Structured logs.** Put `org_id`, `meeting_id`, and `correlation_id` on every structured log line.
-- **Frozen names.** Topic, channel, table, and schema names come from `reprise-docs` `_canon/`; keep them verbatim.
-- **Commits must NOT include a `Co-Authored-By` footer.**
+## Where things live
 
-## 🚦 Cross-Cutting Rules (non-negotiable)
+Two-stack layout:
 
-| Rule | What it means |
-|---|---|
-| **`org_id` on every WS handshake and message** | Resolve `org_id` from the Clerk-verified JWT (pre-validated at `api-gateway`), never from the client payload. Authz on room join: a socket may only join a `meeting_id` room within its own `org_id`. Fail closed if `org_id` is unresolved. |
-| **Prefix every Redis key with `nexus:{org_id}:`** | Pub/sub `nexus:{org_id}:pubsub:meeting:{meeting_id}`, presence `nexus:{org_id}:presence:{meeting_id}`, priority queue `nexus:{org_id}:queue:agent:{user_id}`. |
-| **Persist ONLY finals to `transcript_chunks`** | Interims drive captions only: never persisted, never on the bus. Only `is_final` results become a `transcript_chunks` row and a `transcript-chunks` event. |
-| **The Deepgram key stays server-side** | Audio is proxied backend-to-backend; no client ever holds the key. |
-| **Ephemeral state only** | Durable state lives in Postgres and Redpanda. `realtime-gateway` holds only connection/presence state in Redis; `transcription-service` writes only `transcript_chunks`. A pod may be lost and replaced with no data loss. |
-| **At-least-once + idempotency on produced events** | Use the transactional outbox; put a stable idempotency key in the envelope (`transcript-chunks` -> `chunk:{chunk_id}`). Partition key is always `org_id`. |
+```
+services/realtime-gateway/        # Node + Socket.io + Redis adapter: the fan-out plane
+services/transcription-service/   # Python FastAPI WS proxy: LiveKit audio hook to Deepgram
+proto/                            # shared event / Avro schemas and contracts
+libs/                             # shared helpers: tenancy, envelope, Redis key builders
+README.md  system.md  CLAUDE.md
+```
 
-## 📛 Naming Authority
+- `services/realtime-gateway` (Node): Socket.io server, Redis adapter for cross-instance fan-out, presence sets, Redpanda consumers for `agent-stream`/`agent-results`/`notifications`, `presence-events` producer.
+- `services/transcription-service` (Python): the internal WS endpoint for the LiveKit audio hook, the Deepgram WSS client, interim/final handling, `transcript_chunks` writes, the `transcript-chunks` producer, the `meeting-room-events` consumer.
+- `proto/`: Avro schemas and event contracts shared across the repo. Changes here must be BACKWARD-compatible and land in `_canon/` first.
+- `libs/`: shared cross-cutting helpers, especially the `nexus:{org_id}:` Redis key builders and the event envelope. Reuse these rather than hand-building keys or envelopes.
 
-Topic, channel, table, and schema names come from the `reprise-docs` `_canon/` folder, the frozen source of truth. **Keep these verbatim; never invent or rename:**
+## Invariants you must not break
 
-- **Tables:** `transcript_chunks`
-- **Topics:** `transcript-chunks`, `presence-events`, `meeting-room-events`, `agent-stream`, `agent-results`, `notifications`
-- **Redis channel:** `nexus:{org_id}:pubsub:meeting:{meeting_id}` (and the `nexus:{org_id}:` prefix on all keys)
+| Rule | Why | If you break it |
+|---|---|---|
+| `org_id` on every WS handshake and message, resolved from the Clerk-verified JWT (pre-validated at `api-gateway`), never from the client payload | Multi-tenancy is enforced per connection; authz on room join means a socket may only join a `meeting_id` room within its own `org_id` | Cross-tenant data leak; a socket joins another org's meeting. Fail closed if `org_id` cannot be resolved |
+| Prefix every Redis key with `nexus:{org_id}:` | Per-tenant isolation by channel namespace; a noisy tenant's traffic, eviction, or flush cannot reach another tenant's sockets | Cross-tenant fan-out; one tenant's events land on another's connections |
+| Persist ONLY finals to `transcript_chunks` | Interims are mutable and provisional; only `is_final` results are durable truth | Duplicated, contradictory, and unstable transcript rows; downstream consumers ingest garbage |
+| The Deepgram key never leaves the server | Audio is proxied backend-to-backend; no client should ever hold a provider key | Credential exfiltration; anyone can run Deepgram on your account |
+| Ephemeral state only on real-time pods | Any pod can serve any meeting; losing a pod loses only live sockets, which reconnect with no data loss because durable facts are in Postgres/Redpanda | Pod loss becomes data loss; scaling and rollouts become unsafe |
+| At-least-once plus idempotency on produced events | Redelivery is expected; a stable idempotency key makes redelivery harmless | Double-writes. `transcript-chunks` uses `chunk:{chunk_id}` so a redelivered final never double-writes |
+| Caption latency p95 < 2 s (p99 < 3 s) | This is the live-captions SLO and a user-visible promise | Captions lag the speaker; the live experience breaks |
 
-If a name seems missing or wrong, it changes in `_canon/` first: do not introduce an alternative here.
+## Naming authority
 
-## ✅ Do / ❌ Don't
+Topic, channel, table, and schema names are frozen in `reprise-docs` `_canon/`, the source of truth. Keep these verbatim, never invent or rename:
 
-**✅ Do**
+- Tables: `transcript_chunks`
+- Topics: `transcript-chunks`, `presence-events`, `meeting-room-events`, `agent-stream`, `agent-results`, `notifications`
+- Redis channel: `nexus:{org_id}:pubsub:meeting:{meeting_id}` (and the `nexus:{org_id}:` prefix on every key)
+- Anchors: `A5` (20k streams), `A6` (100k connections)
 
-- Keep `realtime-gateway` and `transcription-service` decoupled; they scale on different anchors (`A6` connections vs `A5` streams).
-- Drop `agent-stream` token deltas first under backpressure; never drop captions or confirmed agent output.
-- Re-hydrate caption/agent history from `core-api` on reconnect (finals are durable).
-- Put `org_id`, `meeting_id`, and `correlation_id` on every structured log line.
+If a name seems missing or wrong, it changes in `_canon/` first. Do not introduce an alternative in this repo.
 
-**❌ Don't**
+## Common tasks (recipes)
 
-- Don't persist interims, or emit them to the bus.
-- Don't send the Deepgram key, LiveKit secret, or any provider key to a client.
-- Don't hold durable domain state on a real-time pod.
-- Don't produce `usage-events` from `transcription-service`; minutes are metered by `billing-metering-service`.
-- Don't treat streamed agent output as a system of record.
-- Don't read `org_id` from a request or message body.
+### Add a new outbound realtime event type (gateway)
+1. Confirm the topic/channel name exists in `_canon/`; if not, land it there first.
+2. In `services/realtime-gateway`, add a Redpanda consumer (or extend an existing one) for the source topic.
+3. Map the bus event to a Socket.io emit, publishing on `nexus:{org_id}:pubsub:meeting:{meeting_id}` so every pod fans out to its local room sockets. Use the `libs/` key builder; do not hand-build the channel.
+4. Carry `org_id`, `meeting_id`, and `correlation_id` through to the emit and onto every log line.
+5. Add a fan-out test proving the event reaches a socket on a different pod.
 
-## 🛠️ Commands
+### Add a new Socket.io room or channel
+1. Key rooms by `meeting_id`; namespace any new Redis key under `nexus:{org_id}:`.
+2. Enforce authz on join: a socket may only join within its JWT-resolved `org_id`, deny by default.
+3. Use the `libs/` Redis key builder so the prefix is never missed.
+
+### Add a transcription event field (BACKWARD-safe schema)
+1. Edit the `TranscriptChunk` Avro schema in `proto/`. Add the field with a default (optional/nullable) so it is BACKWARD-compatible; do not remove or retype existing fields.
+2. In `services/transcription-service`, populate the field only on finals before producing to `transcript-chunks`.
+3. Keep the `transcript_chunks` row and the Avro value in sync if the field is persisted.
+4. Run the Avro BACKWARD compatibility gate locally before pushing.
+
+### Handle a new meeting-room-events case
+1. In `services/transcription-service`, extend the `meeting-room-events` consumer to handle the new LiveKit lifecycle case (for example joined / left / recording-ready).
+2. Start or stop the per-meeting Deepgram stream accordingly; ensure idempotency so a redelivered event does not open a duplicate stream.
+3. Add a test for the new case, including redelivery.
+
+### Add a presence signal
+1. Update the presence set `nexus:{org_id}:presence:{meeting_id}` in `services/realtime-gateway`.
+2. Produce the change as `presence-events` (partitioned by `org_id`, envelope per the contract) for `core-api` analytics.
+3. Keep presence ephemeral: it lives in Redis, not in any durable store.
+
+## Testing
+
+Per stack:
+- `realtime-gateway` (Node): Node test runner for unit/integration. The canonical hard tests are WS fan-out load/soak: many concurrent connections per `meeting_id` room, cross-pod Redis pub/sub delivery, reconnect storms, and backpressure/dropped-frame behavior. Quality gates: ESLint + Prettier.
+- `transcription-service` (Python): `pytest` for the Deepgram proxy, interim-vs-final separation, finals-only persistence, and `transcript-chunks` production; soak tests for many concurrent live streams. Quality gates: ruff + black.
+
+Mock these in tests: LiveKit (the server-side audio hook / internal WS), Deepgram (the WSS ASR session, interims and finals), and Redis pub/sub (cross-pod fan-out). CI runs both stacks plus WS load tests and the Avro BACKWARD compatibility gate before any image is built.
+
+## Local development
+
+Both stacks plus local infra:
 
 ```bash
-# realtime-gateway (Node): install / dev / test
-cd services/realtime-gateway && npm install && npm run dev
-npm run lint && npm test           # includes WS fan-out load tests
+# 1. Local infra: Redis + Redpanda + Schema Registry
+docker compose up -d
 
-# transcription-service (Python): install / run / test
-cd services/transcription-service && pip install -e ".[dev]"
+# 2. realtime-gateway (Node 20+)
+cd services/realtime-gateway
+npm install
+npm run dev
+npm run lint && npm test          # test includes WS fan-out load tests
+
+# 3. transcription-service (Python 3.11+)
+cd services/transcription-service
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
 uvicorn app.main:app --reload --port 8081
 ruff check . && black --check . && pytest
 ```
 
-## 🔀 Pull Requests
+Dev keys: a LiveKit dev URL + API key/secret (audio hook and validation) and a Deepgram dev API key (kept server-side).
 
-- Conventional commits; trunk-based with short-lived branches and PR review.
-- CI must pass: lint + test on both stacks, Avro BACKWARD compatibility gate, and WS load tests.
-- **Commits in this project must NOT include a `Co-Authored-By` footer.**
+Environment variables:
+
+| Variable | Service | Purpose |
+|---|---|---|
+| `DEEPGRAM_API_KEY` | transcription-service | Deepgram WSS key. Stays server-side, never sent to a client |
+| `LIVEKIT_URL` | both | LiveKit server URL for the audio hook / token validation |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | transcription-service | Validate the server-side audio hook handshake |
+| `REDIS_URL` | both | Redis pub/sub + presence (keys prefixed `nexus:{org_id}:`) |
+| `REDPANDA_BROKERS` | both | Kafka-API bootstrap brokers |
+| `SCHEMA_REGISTRY_URL` | both | Avro Schema Registry for `transcript-chunks` / `presence-events` |
+| `WS_BIND_HOST` / `WS_BIND_PORT` | realtime-gateway | WebSocket listener bind config |
+| `TRANSCRIPTION_WS_BIND` | transcription-service | Internal WS bind for the LiveKit audio hook |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | both | OpenTelemetry traces/metrics export |
+
+## Pitfalls
+
+- Persisting interims to `transcript_chunks` or putting them on the bus. Only `is_final` results are durable; interims drive captions and nothing else.
+- Leaking the Deepgram key (or LiveKit secret, or any provider key) to a client. Audio is proxied backend-to-backend only.
+- Missing `org_id` on the WS handshake, or reading it from a request/message body. Resolve it from the JWT and fail closed if absent.
+- Holding durable domain state on a gateway pod. Keep state ephemeral and in Redis so pod loss never means data loss.
+- Fan-out not crossing instances. If pub/sub on `nexus:{org_id}:pubsub:meeting:{meeting_id}` is misconfigured, a participant on another pod silently misses events. Always test cross-pod delivery.
+- Reconnect storms. On reconnect, clients re-mint the LiveKit token and re-join the `meeting_id` room with exponential backoff; re-hydrate caption/agent history from `core-api` (finals are durable). Do not have reconnect logic hammer the gateway in lockstep.
+- Dropping the wrong thing under backpressure. Shed `agent-stream` token deltas first; never drop captions or confirmed agent output.
+
+## Working with other repos
+
+- Consumes event schemas defined in `reprise-events` (`reprise-docs` `_canon/` is the naming authority).
+- Produces `transcript-chunks`, consumed by `reprise-intelligence` and `reprise-backend`.
+- Fans out `agent-stream` and `agent-results` from `reprise-intelligence` to `reprise-ui` and `reprise-mobile` clients.
+- Consumes `meeting-room-events` produced by `meeting-service` (control-plane); produces `presence-events` consumed by `core-api`.
+
+## Commit and PR conventions
+
+- Trunk-based development with short-lived branches and PR review.
+- Conventional commits.
+- CI must pass: lint + test on both stacks, the Avro BACKWARD compatibility gate, and WS load tests.
+- Commits in this project must NOT include a `Co-Authored-By` footer.
