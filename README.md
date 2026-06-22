@@ -1,15 +1,15 @@
-# Reprise AI — Real-time Tier (`reprise-realtime`)
+# Reprise AI - Real-time Tier (`reprise-realtime`)
 
 The WebSocket and streaming tier of Reprise AI: live captions, live transcription, and the fan-out of agent output to every meeting participant.
 
 ## What this is
 
-`reprise-realtime` is the **real-time tier** of Reprise AI — the part of the platform that holds long-lived WebSocket connections and moves low-latency signals in and out of a live meeting. It does two jobs that scale on two different signals:
+`reprise-realtime` is the **real-time tier** of Reprise AI - the part of the platform that holds long-lived WebSocket connections and moves low-latency signals in and out of a live meeting. It does two jobs that scale on two different signals:
 
-- It **transcribes** live meetings — taps server-side audio from LiveKit, proxies it to Deepgram, and persists finalized utterances as `transcript_chunks`.
-- It **fans out** real-time output — live captions, streamed agent token deltas, agent results, and presence — to the `web-app` and mobile clients over WebSockets, fanning across instances so any participant on any pod sees every event.
+- It **transcribes** live meetings - taps server-side audio from LiveKit, proxies it to Deepgram, and persists finalized utterances as `transcript_chunks`.
+- It **fans out** real-time output - live captions, streamed agent token deltas, agent results, and presence - to the `web-app` and mobile clients over WebSockets, fanning across instances so any participant on any pod sees every event.
 
-This tier carries **no media** (that is LiveKit's SFU) and owns **no durable domain data** beyond `transcript_chunks` — its other state is ephemeral connection and presence state held in Redis. Durable state lives in the CRUD and AI tiers.
+This tier carries **no media** (that is LiveKit's SFU) and owns **no durable domain data** beyond `transcript_chunks` - its other state is ephemeral connection and presence state held in Redis. Durable state lives in the CRUD and AI tiers.
 
 ## Services in this repo
 
@@ -28,9 +28,9 @@ The split is deliberate: `transcription-service` scales on **stream count** (`A5
 
 ## Tech stack
 
-- **`realtime-gateway`** — Node + Socket.io with the Redis adapter for cross-instance fan-out; Redis Cluster pub/sub backbone (channel `nexus:{org_id}:pubsub:meeting:{meeting_id}`); presence sets in Redis; `aiokafka`/Kafka-API client for Redpanda consume (`agent-stream`, `agent-results`, `notifications`) and `presence-events` produce.
-- **`transcription-service`** — FastAPI WS proxy; Deepgram streaming SDK over WSS; LiveKit server-side audio hook (internal WS in); `aiokafka` for Redpanda; produces `transcript-chunks` (Avro + Schema Registry).
-- **Shared** — Redpanda (Kafka API, Avro + Schema Registry), Redis (pub/sub + presence), OpenTelemetry for tracing/metrics.
+- **`realtime-gateway`** - Node + Socket.io with the Redis adapter for cross-instance fan-out; Redis Cluster pub/sub backbone (channel `nexus:{org_id}:pubsub:meeting:{meeting_id}`); presence sets in Redis; `aiokafka`/Kafka-API client for Redpanda consume (`agent-stream`, `agent-results`, `notifications`) and `presence-events` produce.
+- **`transcription-service`** - FastAPI WS proxy; Deepgram streaming SDK over WSS; LiveKit server-side audio hook (internal WS in); `aiokafka` for Redpanda; produces `transcript-chunks` (Avro + Schema Registry).
+- **Shared** - Redpanda (Kafka API, Avro + Schema Registry), Redis (pub/sub + presence), OpenTelemetry for tracing/metrics.
 
 ## Repo structure
 
@@ -83,7 +83,7 @@ pytest                         # transcription-service
 
 | Variable | Service | Purpose |
 |---|---|---|
-| `DEEPGRAM_API_KEY` | transcription-service | Deepgram WSS key — **stays server-side, never sent to a client** |
+| `DEEPGRAM_API_KEY` | transcription-service | Deepgram WSS key - **stays server-side, never sent to a client** |
 | `LIVEKIT_URL` | both | LiveKit server URL for the audio hook / token validation |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | transcription-service | Validate the server-side audio hook handshake |
 | `REDIS_URL` | both | Redis pub/sub + presence (keys prefixed `nexus:{org_id}:…`) |
@@ -95,20 +95,20 @@ pytest                         # transcription-service
 
 ## Testing
 
-- **`realtime-gateway`** — Node test runner for unit/integration; **load/soak tests** for WS fan-out (many concurrent connections per `meeting_id` room, cross-pod Redis pub/sub delivery, reconnect storms, backpressure/dropped-frame behavior).
-- **`transcription-service`** — `pytest` for the Deepgram proxy, interim-vs-final separation, finals-only persistence, and `transcript-chunks` production; soak tests for many concurrent live streams.
+- **`realtime-gateway`** - Node test runner for unit/integration; **load/soak tests** for WS fan-out (many concurrent connections per `meeting_id` room, cross-pod Redis pub/sub delivery, reconnect storms, backpressure/dropped-frame behavior).
+- **`transcription-service`** - `pytest` for the Deepgram proxy, interim-vs-final separation, finals-only persistence, and `transcript-chunks` production; soak tests for many concurrent live streams.
 - CI runs both stacks plus WS load tests before any image is built.
 
 ## Related repos
 
-- `reprise-realtime` — this repo: the real-time tier (`realtime-gateway`, `transcription-service`).
-- `reprise-control-plane` — CRUD/control-plane tier (identity, meeting, billing, integration, admin-ops, notification, core-api).
-- `reprise-ai` — AI/inference tier (agent-runtime, embedding, reranker, rag, ingestion, knowledge-graph, search).
-- `reprise-workflows` — async/orchestration (Temporal workers).
-- `reprise-web` — `web-app` (Next.js 14) and the agent sidebar surface.
-- `reprise-gateway` — `api-gateway` / `bff` edge (WAF, rate limit, JWT, `org_id` injection).
-- `reprise-infra` — Kubernetes (EKS/GKE) + Terraform IaC, deployment.
-- `reprise-docs` — architecture canon and the frozen `_canon/` naming authority.
+- `reprise-realtime` - this repo: the real-time tier (`realtime-gateway`, `transcription-service`).
+- `reprise-control-plane` - CRUD/control-plane tier (identity, meeting, billing, integration, admin-ops, notification, core-api).
+- `reprise-ai` - AI/inference tier (agent-runtime, embedding, reranker, rag, ingestion, knowledge-graph, search).
+- `reprise-workflows` - async/orchestration (Temporal workers).
+- `reprise-web` - `web-app` (Next.js 14) and the agent sidebar surface.
+- `reprise-gateway` - `api-gateway` / `bff` edge (WAF, rate limit, JWT, `org_id` injection).
+- `reprise-infra` - Kubernetes (EKS/GKE) + Terraform IaC, deployment.
+- `reprise-docs` - architecture canon and the frozen `_canon/` naming authority.
 
 ## License
 

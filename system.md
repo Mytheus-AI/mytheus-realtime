@@ -1,4 +1,4 @@
-# Reprise AI — Real-time Tier: System Design (`reprise-realtime`)
+# Reprise AI - Real-time Tier: System Design (`reprise-realtime`)
 
 Deep design doc for the real-time tier of Reprise AI. This is the implementation-facing companion to the canon documents `10-realtime-and-transcription.md`, `03-container-architecture.md`, and `07-event-architecture.md`. Where this doc names a topic, table, Redis channel, or anchor, the canon is authoritative and the name is kept verbatim.
 
@@ -12,8 +12,8 @@ It contains exactly two services, and the boundary between them exists because t
 
 | Service | Responsibility | Runtime | Autoscaler signal |
 |---|---|---|---|
-| `transcription-service` | Deepgram WS proxy: server-side audio in, interim/final separation, **only finals** persisted to `transcript_chunks`, produces `transcript-chunks`. | FastAPI WS proxy (Python) | Concurrent **live streams** — anchor `A5` = 20,000 peak meetings |
-| `realtime-gateway` | Socket.io/WSS fan-out plane for non-AV signals: captions, agent output, presence, chat, priority alerts; Redis pub/sub backbone; produces `presence-events`. | Node + Socket.io + Redis adapter | Concurrent **WebSocket connections** — anchor `A6` = 100,000 peak participants |
+| `transcription-service` | Deepgram WS proxy: server-side audio in, interim/final separation, **only finals** persisted to `transcript_chunks`, produces `transcript-chunks`. | FastAPI WS proxy (Python) | Concurrent **live streams** - anchor `A5` = 20,000 peak meetings |
+| `realtime-gateway` | Socket.io/WSS fan-out plane for non-AV signals: captions, agent output, presence, chat, priority alerts; Redis pub/sub backbone; produces `presence-events`. | Node + Socket.io + Redis adapter | Concurrent **WebSocket connections** - anchor `A6` = 100,000 peak participants |
 
 Both services are stateless against durable stores: `transcription-service` writes only `transcript_chunks`; `realtime-gateway` writes nothing durable and holds only ephemeral connection/presence state in Redis.
 
@@ -23,7 +23,7 @@ What this tier does **not** do: it carries no media (LiveKit's SFU does), mints 
 
 ## 2. The three WebSocket flows in detail
 
-### 2.1 Audio in — LiveKit audio hook → `transcription-service` → Deepgram
+### 2.1 Audio in - LiveKit audio hook → `transcription-service` → Deepgram
 
 Audio never leaves the backend trust boundary to reach Deepgram. The LiveKit **server-side audio hook** delivers mixed room audio to `transcription-service` over an internal WS. `transcription-service` opens a **single Deepgram WebSocket session per meeting** and proxies the audio over WSS, keeping the Deepgram API key server-side.
 
@@ -36,13 +36,13 @@ transcription-service  ──WSS (key server-side)──▶  Deepgram
    │ finals    → transcript_chunks (Postgres) + transcript-chunks (Redpanda, Avro)
 ```
 
-One diarized stream per meeting (mixed room audio, server-side subscription) is the locked cost lever — it is why the tier scales on `A5` = 20,000 streams, not on participant count.
+One diarized stream per meeting (mixed room audio, server-side subscription) is the locked cost lever - it is why the tier scales on `A5` = 20,000 streams, not on participant count.
 
-### 2.2 Captions out — Deepgram finals → `realtime-gateway` → client
+### 2.2 Captions out - Deepgram finals → `realtime-gateway` → client
 
 Deepgram **interims** drive live captions in the UI immediately (low-latency, mutable, never persisted, never on the bus). Deepgram **finals** are the durable truth: each final is persisted as a `transcript_chunks` row and produced to the `transcript-chunks` topic, and is also emitted as a caption. Captions reach `web-app`/mobile through `realtime-gateway` within the **caption latency budget of p95 < 2 s** (Deepgram-bound; no LLM in this path).
 
-### 2.3 Agent output out — `agent-stream` + `agent-results` → `realtime-gateway` → sidebar
+### 2.3 Agent output out - `agent-stream` + `agent-results` → `realtime-gateway` → sidebar
 
 The agent sidebar renders LLM output progressively. `agent-stream` token deltas and the final `agent-results` message are consumed from Redpanda by `realtime-gateway` and pushed over WebSocket to the client agent sidebar.
 
@@ -63,7 +63,7 @@ Streaming is a UX latency optimization, never a system of record: a client that 
 ## 3. `transcription-service` detail
 
 - **Server-side audio path.** Receives the LiveKit audio hook over an internal WS; proxies to Deepgram over WSS. The **Deepgram key never leaves the server**.
-- **Interim vs final.** The Deepgram session runs streaming ASR with **speaker diarization** and **interim + final** results. Interims drive captions only — never persisted, never on the bus. **Only finals** are durable.
+- **Interim vs final.** The Deepgram session runs streaming ASR with **speaker diarization** and **interim + final** results. Interims drive captions only - never persisted, never on the bus. **Only finals** are durable.
 - **Persist finals only.** Each final utterance, merged by speaker turn, is written as one `transcript_chunks` row (`org_id`, `meeting_id`, `speaker_id`, `start_ms`, `end_ms`, `text`, `is_final`, `confidence`) and then produced to the `transcript-chunks` topic as the `TranscriptChunk` Avro value, enveloped per `07-event-architecture.md`.
 - **Diarization mapping.** The diarized `speaker_id` label is emitted as-is; the confirmed `speaker_id → user_id` mapping is resolved downstream (via `meeting_speakers`), never guessed at write time.
 - **Consumes `meeting-room-events`.** Opens/closes Deepgram streams in response to LiveKit lifecycle events (joined / left / recording-ready) produced by `meeting-service`.
@@ -99,7 +99,7 @@ The two services share a scaling family but ride **opposite anchors**:
 - `transcription-service` scales on `A5` = **20,000 concurrent live streams** (one diarized Deepgram session per meeting).
 - `realtime-gateway` scales on `A6` = **100,000 concurrent WebSocket connections** (one per participant).
 
-20,000 meetings carry ~100,000 live connections (effective occupancy `A8` ≈ 5.0), not `20,000 × 6` nominal — which is exactly why the two anchors are not interchangeable. Coupling them in one process forces one to over-provision for the other's load. Separate containers with separate HPAs/KEDA scalers is the structural fix.
+20,000 meetings carry ~100,000 live connections (effective occupancy `A8` ≈ 5.0), not `20,000 × 6` nominal - which is exactly why the two anchors are not interchangeable. Coupling them in one process forces one to over-provision for the other's load. Separate containers with separate HPAs/KEDA scalers is the structural fix.
 
 ---
 
@@ -108,7 +108,7 @@ The two services share a scaling family but ride **opposite anchors**:
 `org_id` is non-optional and present on every connection and every message:
 
 - The WS handshake carries the Clerk-verified JWT (pre-validated at `api-gateway`); `org_id` is resolved from it, never from the client payload. Authz is enforced on room join (a socket may only join a `meeting_id` room within its own `org_id`).
-- Every Redis key is prefixed `nexus:{org_id}:…` — pub/sub channel `nexus:{org_id}:pubsub:meeting:{meeting_id}`, presence `nexus:{org_id}:presence:{meeting_id}`, priority queue `nexus:{org_id}:queue:agent:{user_id}`.
+- Every Redis key is prefixed `nexus:{org_id}:…` - pub/sub channel `nexus:{org_id}:pubsub:meeting:{meeting_id}`, presence `nexus:{org_id}:presence:{meeting_id}`, priority queue `nexus:{org_id}:queue:agent:{user_id}`.
 - Fan-out is **per-tenant isolated** by the channel namespace, so a noisy tenant's traffic, eviction, or flush cannot reach another tenant's sockets.
 - Every produced event (`transcript-chunks`, `presence-events`) is partitioned by `org_id` and carries it in the envelope header.
 
@@ -133,10 +133,10 @@ All produced events follow the at-least-once contract: transactional outbox on p
 
 ## 8. Backpressure & resilience
 
-- **Sticky connections, stateless state.** A WebSocket is pinned to its owning pod for its lifetime (connection-hash / `sid` affinity at the ingress). This is connection stickiness, not session stickiness — the application state behind it is stateless and in Redis.
+- **Sticky connections, stateless state.** A WebSocket is pinned to its owning pod for its lifetime (connection-hash / `sid` affinity at the ingress). This is connection stickiness, not session stickiness - the application state behind it is stateless and in Redis.
 - **Reconnect.** Socket.io auto-reconnect with exponential backoff. On reconnect the client re-mints its LiveKit token (via `meeting-service`) and re-joins the `meeting_id` room; caption/agent history is re-hydrated from `core-api` (finals are durable). Target: Deepgram WS proxy reconnect **> 99.9% within 2 s**.
 - **At-least-once caption delivery.** Captions and confirmed agent outputs are preserved under congestion; a dropped socket never loses transcript or confirmed agent output because finals are durable.
-- **Per-connection backpressure / dropped-frame handling.** Each socket has a bounded outbound buffer. Under client slow-consume, **`agent-stream` token deltas are dropped first** (throwaway — the UI still gets the final `agent-results`); captions and confirmed outputs are never dropped. This mirrors the bus-level shed order.
+- **Per-connection backpressure / dropped-frame handling.** Each socket has a bounded outbound buffer. Under client slow-consume, **`agent-stream` token deltas are dropped first** (throwaway - the UI still gets the final `agent-results`); captions and confirmed outputs are never dropped. This mirrors the bus-level shed order.
 - **Priority pre-emption.** The per-user queue `nexus:{org_id}:queue:agent:{user_id}` lets urgent alerts (conflict banner, workload warning) pre-empt routine note deltas on a congested connection.
 - **Redis pub/sub backbone.** Cross-pod fan-out and presence ride Redis Cluster; pod loss is recoverable because no durable state is on the pod.
 
@@ -147,7 +147,7 @@ All produced events follow the at-least-once contract: transactional outbox on p
 - **Deepgram key never leaves the server.** Audio is proxied backend-to-backend; no client ever holds the Deepgram key.
 - **JWT + `org_id` on the WS handshake.** The Clerk JWT is pre-validated at `api-gateway`; `org_id` and role are extracted before the connection reaches `realtime-gateway`. The handshake fails closed if `org_id` cannot be resolved.
 - **Authz on room join.** Deny-by-default: a socket may only join a `meeting_id` room within its JWT-resolved `org_id`; cross-tenant room joins are rejected.
-- **Server-side audio only.** The LiveKit audio hook is a backend track subscription — no client audio uplink to the transcription path.
+- **Server-side audio only.** The LiveKit audio hook is a backend track subscription - no client audio uplink to the transcription path.
 
 ---
 
@@ -167,7 +167,7 @@ Autoscaling is KEDA-driven: `realtime-gateway` scales on **concurrent WebSocket 
 
 ## 11. Statelessness
 
-Both services are in the stateless-services-durable-stores invariant. `transcription-service` writes only `transcript_chunks` (and produces to the bus). `realtime-gateway` holds **only ephemeral connection and presence state, backed by Redis** — pub/sub channels, presence sets, the per-user priority queue. No durable domain state lives on a real-time pod; losing a pod loses only live sockets, which reconnect with no data loss.
+Both services are in the stateless-services-durable-stores invariant. `transcription-service` writes only `transcript_chunks` (and produces to the bus). `realtime-gateway` holds **only ephemeral connection and presence state, backed by Redis** - pub/sub channels, presence sets, the per-user priority queue. No durable domain state lives on a real-time pod; losing a pod loses only live sockets, which reconnect with no data loss.
 
 ---
 
@@ -198,8 +198,8 @@ Both services are in the stateless-services-durable-stores invariant. `transcrip
 
 ## 15. Canon references
 
-- `10-realtime-and-transcription.md` — the authoritative real-time & transcription spec (LiveKit transport, Deepgram proxy, `transcript_chunks`, captions, Socket.io fan-out, latency budget).
-- `03-container-architecture.md` — C4 L2 view; `realtime-gateway` & `transcription-service` containers, the three WebSocket flows (§4.3), scaling families (§8).
-- `07-event-architecture.md` — topic catalog, Avro envelope, partitioning, at-least-once delivery for `transcript-chunks`, `presence-events`, `agent-stream`, `agent-results`, `meeting-room-events`, `notifications`.
+- `10-realtime-and-transcription.md` - the authoritative real-time & transcription spec (LiveKit transport, Deepgram proxy, `transcript_chunks`, captions, Socket.io fan-out, latency budget).
+- `03-container-architecture.md` - C4 L2 view; `realtime-gateway` & `transcription-service` containers, the three WebSocket flows (§4.3), scaling families (§8).
+- `07-event-architecture.md` - topic catalog, Avro envelope, partitioning, at-least-once delivery for `transcript-chunks`, `presence-events`, `agent-stream`, `agent-results`, `meeting-room-events`, `notifications`.
 
 Any change to a frozen name, number, or contract must land in `reprise-docs` `_canon/` first and propagate outward.
