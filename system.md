@@ -1,12 +1,12 @@
-# Reprise AI - Real-time Tier: System Design (`reprise-realtime`)
+# Mytheus - Real-time Tier: System Design (`mytheus-realtime`)
 
-Deep design doc for the real-time tier of Reprise AI. This is the implementation-facing companion to the canon documents `10-realtime-and-transcription.md`, `03-container-architecture.md`, and `07-event-architecture.md`. Where this doc names a topic, table, Redis channel, or anchor, the canon is authoritative and the name is kept verbatim.
+Deep design doc for the real-time tier of Mytheus. This is the implementation-facing companion to the canon documents `10-realtime-and-transcription.md`, `03-container-architecture.md`, and `07-event-architecture.md`. Where this doc names a topic, table, Redis channel, or anchor, the canon is authoritative and the name is kept verbatim.
 
 ---
 
 ## 1. Purpose & bounded context
 
-The real-time tier owns the **live path** of a Reprise AI meeting: from server-side audio capture, through Deepgram transcription, to live captions and streamed agent output landing in the participant's browser/mobile client. It holds the platform's long-lived WebSocket connections and its only live audio proxy.
+The real-time tier owns the **live path** of a Mytheus meeting: from server-side audio capture, through Deepgram transcription, to live captions and streamed agent output landing in the participant's browser/mobile client. It holds the platform's long-lived WebSocket connections and its only live audio proxy.
 
 It contains exactly two services, and the boundary between them exists because they scale on **different signals** and must never be coupled:
 
@@ -202,4 +202,4 @@ Both services are in the stateless-services-durable-stores invariant. `transcrip
 - `03-container-architecture.md` - C4 L2 view; `realtime-gateway` & `transcription-service` containers, the three WebSocket flows (§4.3), scaling families (§8).
 - `07-event-architecture.md` - topic catalog, Avro envelope, partitioning, at-least-once delivery for `transcript-chunks`, `presence-events`, `agent-stream`, `agent-results`, `meeting-room-events`, `notifications`.
 
-Any change to a frozen name, number, or contract must land in `reprise-docs` `_canon/` first and propagate outward.
+Any change to a frozen name, number, or contract must land in `mytheus-docs` `_canon/` first and propagate outward.

@@ -1,10 +1,10 @@
 # CLAUDE.md
 
-This is `reprise-realtime`, the real-time tier of Reprise AI: a Node/Socket.io `realtime-gateway` (WebSocket fan-out) and a Python/FastAPI `transcription-service` (LiveKit audio hook to Deepgram). The single most important thing: these are two services that scale on different signals and stay decoupled, only Deepgram finals persist to `transcript_chunks` (interims never do), and the Deepgram key stays server-side.
+This is `mytheus-realtime`, the real-time tier of Mytheus: a Node/Socket.io `realtime-gateway` (WebSocket fan-out) and a Python/FastAPI `transcription-service` (LiveKit audio hook to Deepgram). The single most important thing: these are two services that scale on different signals and stay decoupled, only Deepgram finals persist to `transcript_chunks` (interims never do), and the Deepgram key stays server-side.
 
 ## Repo at a glance
 
-The real-time tier owns the live path of a Reprise AI meeting: server-side audio capture, Deepgram transcription, and the fan-out of live captions and streamed agent output to the participant's browser or mobile client. It holds the platform's long-lived WebSocket connections and its only live audio proxy.
+The real-time tier owns the live path of a Mytheus meeting: server-side audio capture, Deepgram transcription, and the fan-out of live captions and streamed agent output to the participant's browser or mobile client. It holds the platform's long-lived WebSocket connections and its only live audio proxy.
 
 It contains exactly two services, in two separate containers, because they scale on different and non-interchangeable signals:
 
@@ -70,7 +70,7 @@ README.md  system.md  CLAUDE.md
 
 ## Naming authority
 
-Topic, channel, table, and schema names are frozen in `reprise-docs` `_canon/`, the source of truth. Keep these verbatim, never invent or rename:
+Topic, channel, table, and schema names are frozen in `mytheus-docs` `_canon/`, the source of truth. Keep these verbatim, never invent or rename:
 
 - Tables: `transcript_chunks`
 - Topics: `transcript-chunks`, `presence-events`, `meeting-room-events`, `agent-stream`, `agent-results`, `notifications`
@@ -167,9 +167,9 @@ Environment variables:
 
 ## Working with other repos
 
-- Consumes event schemas defined in `reprise-events` (`reprise-docs` `_canon/` is the naming authority).
-- Produces `transcript-chunks`, consumed by `reprise-intelligence` and `reprise-backend`.
-- Fans out `agent-stream` and `agent-results` from `reprise-intelligence` to `reprise-ui` and `reprise-mobile` clients.
+- Consumes event schemas defined in `mytheus-events` (`mytheus-docs` `_canon/` is the naming authority).
+- Produces `transcript-chunks`, consumed by `mytheus-intelligence` and `mytheus-backend`.
+- Fans out `agent-stream` and `agent-results` from `mytheus-intelligence` to `mytheus-ui` and `mytheus-mobile` clients.
 - Consumes `meeting-room-events` produced by `meeting-service` (control-plane); produces `presence-events` consumed by `core-api`.
 
 ## Commit and PR conventions

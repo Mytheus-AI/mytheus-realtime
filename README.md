@@ -1,10 +1,10 @@
-# Reprise AI - Real-time Tier (`reprise-realtime`)
+# Mytheus - Real-time Tier (`mytheus-realtime`)
 
-The WebSocket and streaming tier of Reprise AI: live captions, live transcription, and the fan-out of agent output to every meeting participant.
+The WebSocket and streaming tier of Mytheus: live captions, live transcription, and the fan-out of agent output to every meeting participant.
 
 ## What this is
 
-`reprise-realtime` is the **real-time tier** of Reprise AI - the part of the platform that holds long-lived WebSocket connections and moves low-latency signals in and out of a live meeting. It does two jobs that scale on two different signals:
+`mytheus-realtime` is the **real-time tier** of Mytheus - the part of the platform that holds long-lived WebSocket connections and moves low-latency signals in and out of a live meeting. It does two jobs that scale on two different signals:
 
 - It **transcribes** live meetings - taps server-side audio from LiveKit, proxies it to Deepgram, and persists finalized utterances as `transcript_chunks`.
 - It **fans out** real-time output - live captions, streamed agent token deltas, agent results, and presence - to the `web-app` and mobile clients over WebSockets, fanning across instances so any participant on any pod sees every event.
@@ -35,7 +35,7 @@ The split is deliberate: `transcription-service` scales on **stream count** (`A5
 ## Repo structure
 
 ```
-reprise-realtime/
+mytheus-realtime/
 ├── services/
 │   ├── realtime-gateway/        # Node + Socket.io fan-out plane
 │   └── transcription-service/   # Python (FastAPI) Deepgram WS proxy
@@ -101,15 +101,15 @@ pytest                         # transcription-service
 
 ## Related repos
 
-- `reprise-realtime` - this repo: the real-time tier (`realtime-gateway`, `transcription-service`).
-- `reprise-control-plane` - CRUD/control-plane tier (identity, meeting, billing, integration, admin-ops, notification, core-api).
-- `reprise-ai` - AI/inference tier (agent-runtime, embedding, reranker, rag, ingestion, knowledge-graph, search).
-- `reprise-workflows` - async/orchestration (Temporal workers).
-- `reprise-web` - `web-app` (Next.js 14) and the agent sidebar surface.
-- `reprise-gateway` - `api-gateway` / `bff` edge (WAF, rate limit, JWT, `org_id` injection).
-- `reprise-infra` - Kubernetes (EKS/GKE) + Terraform IaC, deployment.
-- `reprise-docs` - architecture canon and the frozen `_canon/` naming authority.
+- `mytheus-realtime` - this repo: the real-time tier (`realtime-gateway`, `transcription-service`).
+- `mytheus-control-plane` - CRUD/control-plane tier (identity, meeting, billing, integration, admin-ops, notification, core-api).
+- `mytheus` - AI/inference tier (agent-runtime, embedding, reranker, rag, ingestion, knowledge-graph, search).
+- `mytheus-workflows` - async/orchestration (Temporal workers).
+- `mytheus-web` - `web-app` (Next.js 14) and the agent sidebar surface.
+- `mytheus-gateway` - `api-gateway` / `bff` edge (WAF, rate limit, JWT, `org_id` injection).
+- `mytheus-infra` - Kubernetes (EKS/GKE) + Terraform IaC, deployment.
+- `mytheus-docs` - architecture canon and the frozen `_canon/` naming authority.
 
 ## License
 
-Proprietary © Reprise AI. All rights reserved.
+Proprietary © Mytheus. All rights reserved.
