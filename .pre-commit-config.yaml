@@ -1,0 +1,28 @@
+# pre-commit hooks for mytheus-realtime (mixed Node + Python repo).
+# Install once: `pre-commit install`. Python hooks scope to transcription-service; the gateway is
+# type-checked with tsc.
+repos:
+  - repo: local
+    hooks:
+      - id: transcription-ruff
+        name: transcription-service ruff + black
+        entry: bash -c 'cd services/transcription-service && uv run ruff check . && uv run black --check .'
+        language: system
+        pass_filenames: false
+        files: '^services/transcription-service/'
+      - id: transcription-mypy
+        name: transcription-service mypy
+        entry: bash -c 'cd services/transcription-service && uv run mypy .'
+        language: system
+        pass_filenames: false
+        files: '^services/transcription-service/'
+      - id: gateway-tsc
+        name: realtime-gateway tsc typecheck
+        entry: bash -c 'cd services/realtime-gateway && npm run typecheck'
+        language: system
+        pass_filenames: false
+        files: '^services/realtime-gateway/.*\.ts$'
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
