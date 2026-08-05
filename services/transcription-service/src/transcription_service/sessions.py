@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from .audit import record_session_decision
 from .db import set_current_org
 from .persistence import process_utterance
 from .providers.base import TranscriptionProvider, TranscriptionStream
@@ -60,6 +61,16 @@ class SessionTracker:
                 await set_current_org(session, org_id)
                 region = await get_data_residency_region(session, org_id)
                 pii_redaction_enabled = await get_pii_redaction_enabled(session, org_id)
+                # Compliance gate acceptance check: "an audit-log entry records the
+                # redaction-toggle and any cross-border decision" — same transaction as the
+                # reads above, so the audit entry and the decision it records can never drift.
+                await record_session_decision(
+                    session,
+                    org_id=org_id,
+                    meeting_id=meeting_id,
+                    region=region,
+                    pii_redaction_enabled=pii_redaction_enabled,
+                )
 
         stream = await self.provider.open_stream(
             org_id=org_id, meeting_id=meeting_id, region=region

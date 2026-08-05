@@ -31,8 +31,16 @@ RLS: `ENABLE` + `FORCE` + `tenant_isolation`, identical predicate shape to every
 table in this database (`mytheus-backend`'s `82d44163c933`/`a1c4e7f20b18`): `org_id =
 NULLIF(current_setting('app.current_org', true), '')::uuid`, fail-closed (zero rows, not an
 error, when unset). Row Level Security policies defined on a partitioned PARENT table apply
-automatically to every partition, current and future, since Postgres 11 -- no per-partition
-policy statements needed.
+automatically to every partition ONLY when queried through the parent, current and future,
+since Postgres 11 -- but privileges and the row-security *state* do not propagate the same
+way. See `migrations/_partition_privileges.py` (fix round 1, item 3): each partition below is
+explicitly `REVOKE`d from every application role right after creation, because
+`mytheus-backend`'s `ALTER DEFAULT PRIVILEGES` (migration `92ae826`) grants the full DML set
+to `mytheus_app`/`mytheus_admin` on every table newly created in this schema, partitions
+included, and a partition named directly bypasses both that grant's absence-of-restriction AND
+the parent's RLS policy. Verified live before this fix: `mytheus_app` could
+`DELETE FROM transcript_chunks_2026_08` across every tenant even though
+`DELETE FROM transcript_chunks` was correctly RLS-scoped.
 
 Local index `(meeting_id, start_ms)`: created on the partitioned parent, which Postgres
 propagates to every existing and future partition automatically (`CREATE INDEX ON <parent>`
@@ -49,6 +57,8 @@ from collections.abc import Sequence
 from datetime import date
 
 from alembic import op
+
+from migrations._partition_privileges import lock_down_partition
 
 revision: str = "be66698dbefb"
 down_revision: str | None = None
@@ -120,11 +130,13 @@ def upgrade() -> None:
             f"CREATE TABLE {partition_name} PARTITION OF {TABLE} "
             f"FOR VALUES FROM ('{start.isoformat()}') TO ('{end.isoformat()}');"
         )
+        lock_down_partition(op, partition_name)
 
     # Catch-all so an insert for a month outside the premade range fails loudly into a real
     # (if unpruned) partition rather than erroring outright; the maintenance job replaces the
     # need for this by keeping premade partitions ahead of `now()`.
     op.execute(f"CREATE TABLE {TABLE}_default PARTITION OF {TABLE} DEFAULT;")
+    lock_down_partition(op, f"{TABLE}_default")
 
 
 def downgrade() -> None:

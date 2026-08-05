@@ -85,3 +85,40 @@ async def test_final_utterances_from_the_pump_persist_exactly_once(
             )
         ).scalar_one()
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_default_script_persists_through_the_real_pipeline(
+    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+) -> None:
+    """Fix round 1, item 1: `FakeProvider()` with NO script override is exactly what
+    `select_provider()` returns when `DEEPGRAM_API_KEY` is unset — the actual default path a
+    fresh local run takes. Every other test in this file overrides `chunk_id` with
+    `str(uuid.uuid4())`, which is precisely why the old `default_script(chunk_id="utt-1")`
+    landmine (a non-UUID default that crashed the INSERT) went uncaught. This test drives the
+    UNMODIFIED default all the way through `SessionTracker`'s real background pump into a real
+    Postgres INSERT and asserts it succeeds."""
+    org_id, meeting_id = tenant["org_id"], tenant["meeting_id"]
+    provider = FakeProvider()  # script=None -> default_script(), chunk_id NOT overridden
+    tracker = SessionTracker(provider=provider, session_factory=session_factory, redis=redis_client)
+
+    await tracker.on_participant_joined(org_id=org_id, meeting_id=meeting_id)
+    await asyncio.sleep(0.2)
+    await tracker.on_participant_left(org_id=org_id, meeting_id=meeting_id)
+
+    async with session_factory() as session:
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT text, is_final FROM transcript_chunks "
+                        "WHERE org_id = :org_id AND meeting_id = :meeting_id"
+                    ),
+                    {"org_id": org_id, "meeting_id": meeting_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["is_final"] is True
+    assert row["text"] == "hello there, how are you"

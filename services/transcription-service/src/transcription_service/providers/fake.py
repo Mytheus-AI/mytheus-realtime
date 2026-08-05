@@ -8,6 +8,7 @@ opened and with what region/diarize arguments.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 
@@ -22,11 +23,21 @@ class _RecordedOpen:
     diarize: bool
 
 
-def default_script(chunk_id: str = "utt-1") -> list[Utterance]:
+def default_script(chunk_id: str | None = None) -> list[Utterance]:
     """A realistic interim-then-final sequence for ONE utterance: two mutable interims that
     revise the transcript, then the final. This is the shape
     `tests/test_persistence_finals_only.py` (the load-bearing test) drives through the real
-    pipeline."""
+    pipeline.
+
+    `chunk_id` defaults to a fresh `uuid.uuid4()` per call, NOT a fixed placeholder string
+    (fix round 1, item 1: the old `"utt-1"` default was not a valid UUID and crashed the
+    identical INSERT `DeepgramProvider` crashed on — a landmine nothing caught because every
+    existing test overrode `chunk_id` with `str(uuid.uuid4())`; the first real caller to reach
+    `select_provider()`'s no-key default, unmodified, would have hit it. See
+    `tests/test_sessions.py::test_default_script_persists_through_the_real_pipeline`, which
+    now drives this default end to end)."""
+    if chunk_id is None:
+        chunk_id = str(uuid.uuid4())
     return [
         Utterance(
             chunk_id=chunk_id,

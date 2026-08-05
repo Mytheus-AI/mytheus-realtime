@@ -15,11 +15,20 @@ from typing import Protocol
 
 @dataclass(frozen=True)
 class Utterance:
-    """One Deepgram result — interim or final. `chunk_id` is stable across interim/final
-    revisions of the SAME utterance only for a real provider that assigns it that way;
-    finals are what get persisted and `chunk_id` is what `chunk:{chunk_id}` idempotency keys
-    off, so it must be stable across redelivery of the same final (i.e. the provider/consumer
-    boundary, not per network read)."""
+    """One Deepgram result — interim or final. `chunk_id` MUST be a valid UUID string: it is
+    the `transcript_chunks.id` primary key (`uuid NOT NULL`) and the Avro `chunk_id` field is
+    `logicalType: uuid` — a non-UUID value fails the INSERT (fix round 1, item 1: Deepgram's
+    `request_id` is not a UUID). It must also be DETERMINISTIC given the same underlying
+    provider event, not random per read: it is stable across interim/final revisions of the
+    SAME utterance for a real provider that assigns it that way, and `chunk:{chunk_id}` is
+    what redelivery idempotency keys off, so redelivery of the same final must derive the same
+    `chunk_id` again, not a fresh random one (a random UUID per read would silently defeat the
+    outbox's `(topic, idempotency_key)` dedup guard).
+
+    `provider_correlation_id` carries the vendor's own request/session identifier (Deepgram's
+    `request_id`) for support/debugging correlation against the vendor's own dashboard, kept
+    separate from `chunk_id` precisely because `chunk_id` must be a UUID and the vendor's id is
+    not."""
 
     chunk_id: str
     speaker_id: str
@@ -28,6 +37,7 @@ class Utterance:
     text: str
     is_final: bool
     confidence: float
+    provider_correlation_id: str | None = None
 
 
 class TranscriptionStream(Protocol):

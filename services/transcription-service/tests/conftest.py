@@ -94,6 +94,13 @@ async def tenant(
                 await session.execute(
                     text("DELETE FROM outbox WHERE org_id = :org_id"), {"org_id": org_id}
                 )
+                # audit_logs.org_id REFERENCES organizations(id) ON DELETE RESTRICT (append-only
+                # table, fix round 1 item 2): must clear this before the organizations delete
+                # below or that delete fails with a foreign-key violation for every test that
+                # exercises SessionTracker.on_participant_joined (which now writes an audit row).
+                await session.execute(
+                    text("DELETE FROM audit_logs WHERE org_id = :org_id"), {"org_id": org_id}
+                )
                 await session.execute(
                     text("DELETE FROM data_residency WHERE org_id = :org_id"), {"org_id": org_id}
                 )

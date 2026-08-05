@@ -19,6 +19,7 @@ change; nothing else in this repo imports Deepgram.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from urllib.parse import urlencode
@@ -48,14 +49,28 @@ class _DeepgramStream:
             speaker = str(words[0]["speaker"]) if words and "speaker" in words[0] else "0"
             start_ms = int(msg.get("start", 0) * 1000)
             duration_ms = int(msg.get("duration", 0) * 1000)
+            # `request_id` (Deepgram's own session identifier) is NOT a UUID and is constant
+            # across every message in one streaming session, not unique per utterance — it
+            # cannot be used directly as `chunk_id` (fix round 1, item 1: this crashed every
+            # real INSERT with "invalid input for query argument: invalid UUID"). `chunk_id`
+            # is derived deterministically via uuid5 so the SAME (request_id, start_ms) pair
+            # always yields the SAME valid UUID — required for `chunk:{chunk_id}` idempotency
+            # to mean anything on redelivery of the identical message. The raw `request_id`
+            # is preserved separately on `provider_correlation_id` for support/debugging
+            # correlation against Deepgram's own dashboard, which the derived UUID does not
+            # give up (uuid5 is one-way for this purpose; that's fine, it's not meant to be
+            # decoded, only reproduced from the same inputs).
+            request_id = msg.get("request_id", "")
+            chunk_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deepgram:{request_id}:{start_ms}"))
             yield Utterance(
-                chunk_id=msg.get("request_id", "") + f":{start_ms}",
+                chunk_id=chunk_id,
                 speaker_id=speaker,
                 start_ms=start_ms,
                 end_ms=start_ms + duration_ms,
                 text=alt.get("transcript", ""),
                 is_final=bool(msg.get("is_final", False)),
                 confidence=float(alt.get("confidence", 0.0)),
+                provider_correlation_id=request_id or None,
             )
 
     async def close(self) -> None:
