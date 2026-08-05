@@ -53,20 +53,42 @@ class _DeepgramStream:
             # across every message in one streaming session, not unique per utterance — it
             # cannot be used directly as `chunk_id` (fix round 1, item 1: this crashed every
             # real INSERT with "invalid input for query argument: invalid UUID"). `chunk_id`
-            # is derived deterministically via uuid5 so the SAME (request_id, start_ms) pair
+            # is derived deterministically via uuid5 so the SAME underlying provider event
             # always yields the SAME valid UUID — required for `chunk:{chunk_id}` idempotency
             # to mean anything on redelivery of the identical message. The raw `request_id`
             # is preserved separately on `provider_correlation_id` for support/debugging
             # correlation against Deepgram's own dashboard, which the derived UUID does not
             # give up (uuid5 is one-way for this purpose; that's fine, it's not meant to be
             # decoded, only reproduced from the same inputs).
+            #
+            # Fix round 2: (request_id, start_ms) ALONE is not a sufficient key. request_id
+            # is constant for the whole session, so it contributes nothing to disambiguation
+            # within one session, and two GENUINELY DISTINCT finals can share a start_ms —
+            # this is diarized transcription, so two speakers starting to talk at the same
+            # millisecond is ordinary overlapping speech, not an edge case. Under the old key
+            # the second speaker's final collided with the first's chunk_id and was silently
+            # swallowed as a "redelivery" by the outbox's idempotency gate in
+            # persistence.py::_write_final — a real transcript line dropped with no error and
+            # no log. `speaker_id` is what actually distinguishes concurrent speech, so it is
+            # now part of the key; `end_ms` is included too so two utterances from the SAME
+            # speaker would additionally need to share both boundaries exactly to collide,
+            # which for genuinely distinct utterances they will not. This keeps the
+            # determinism property the idempotency contract depends on (same underlying
+            # event -> same key) while making a collision between two DISTINCT utterances
+            # require the same speaker AND the same start AND the same end, which is what a
+            # true redelivery of the identical message looks like, not two different ones.
             request_id = msg.get("request_id", "")
-            chunk_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deepgram:{request_id}:{start_ms}"))
+            end_ms = start_ms + duration_ms
+            chunk_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL, f"deepgram:{request_id}:{speaker}:{start_ms}:{end_ms}"
+                )
+            )
             yield Utterance(
                 chunk_id=chunk_id,
                 speaker_id=speaker,
                 start_ms=start_ms,
-                end_ms=start_ms + duration_ms,
+                end_ms=end_ms,
                 text=alt.get("transcript", ""),
                 is_final=bool(msg.get("is_final", False)),
                 confidence=float(alt.get("confidence", 0.0)),
