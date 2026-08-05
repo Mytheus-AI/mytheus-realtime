@@ -113,4 +113,41 @@ describe("presence set (real Redis)", () => {
       await redis.srem(presenceIndexKey(), `${orgId}|${staleMeeting}`, `${orgId}|${freshMeeting}`);
     }
   });
+
+  it("two concurrent sweeps of the same stale entry (simulating two pods) report it reaped exactly once", async () => {
+    // Two separate connections, like two separate gateway pods each with their own ioredis
+    // client — not two calls sharing one connection, which would trivially serialize on the wire
+    // regardless of whether the underlying read-then-remove was atomic.
+    const redisA = new Redis(REDIS_URL);
+    const redisB = new Redis(REDIS_URL);
+    const orgId = `org-${randomUUID()}`;
+    const meetingId = `meeting-${randomUUID()}`;
+    const userId = "ghost-user";
+
+    try {
+      await heartbeat(redis, orgId, meetingId, userId, Date.now() - 10_000);
+
+      const [reapedA, reapedB] = await Promise.all([
+        sweepStalePresence(redisA, STALE_AFTER_MS),
+        sweepStalePresence(redisB, STALE_AFTER_MS),
+      ]);
+
+      const matches = (r: { orgId: string; meetingId: string; userId: string }) =>
+        r.orgId === orgId && r.meetingId === meetingId && r.userId === userId;
+      const totalReports = reapedA.filter(matches).length + reapedB.filter(matches).length;
+
+      // Without the atomic Lua script, both concurrent sweeps could read the member as stale
+      // before either removed it, and both would report it — this is the bug the fix round
+      // caught. With it, at most one of the two calls can ever see it.
+      expect(totalReports).toBe(1);
+
+      // and it really is gone, not just under-reported
+      expect(await redis.zscore(presenceKey(orgId, meetingId), userId)).toBeNull();
+    } finally {
+      redisA.disconnect();
+      redisB.disconnect();
+      await redis.del(presenceKey(orgId, meetingId));
+      await redis.srem(presenceIndexKey(), `${orgId}|${meetingId}`);
+    }
+  });
 });

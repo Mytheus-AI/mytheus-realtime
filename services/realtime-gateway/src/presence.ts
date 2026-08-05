@@ -79,12 +79,32 @@ export interface StalePresenceMember {
 }
 
 /**
+ * Atomically reads and removes the stale members of one presence ZSET, returning exactly the
+ * members THIS invocation removed. Must be a single Lua script, not two round trips (`ZRANGEBYSCORE`
+ * then `ZREM`): with two round trips, two concurrent callers (e.g. two pods sweeping at roughly
+ * the same moment, most likely right after a rolling deploy when many pods' sweep timers are
+ * roughly phase-aligned) can both read the same stale member before either removes it, and both
+ * then report it reaped — which upstream means two `presence-events` "leave" records for one real
+ * transition. Redis executes an EVAL script as a single atomic command, so whichever caller's
+ * script runs second sees the member already gone and returns nothing for it — no member can ever
+ * be reported reaped by more than one caller. See test/presence.test.ts's concurrency test for a
+ * reproduction against a real two-connection race.
+ */
+const SWEEP_ONE_KEY_SCRIPT = `
+local stale = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if #stale > 0 then
+  redis.call('ZREM', KEYS[1], unpack(stale))
+end
+return stale
+`;
+
+/**
  * Reaps members whose last heartbeat is older than `staleAfterMs`, across every meeting the index
  * knows has live presence. Returns the reaped members so the caller (see `src/server.ts`) can
  * broadcast an updated presence list and produce a `leave` presence-event for each — this function
  * only prunes storage, it has no knowledge of Socket.io rooms or Kafka. Safe to run concurrently
- * from multiple pods: `ZREMRANGEBYSCORE`-equivalent removal here is idempotent (removing an
- * already-gone member is a no-op), so two pods racing to sweep the same stale entry do no harm.
+ * from multiple pods: the read-and-remove of each key is atomic (see `SWEEP_ONE_KEY_SCRIPT`), so a
+ * member is reported reaped by at most one caller, never more.
  */
 export async function sweepStalePresence(
   redis: Redis,
@@ -98,11 +118,13 @@ export async function sweepStalePresence(
   for (const entry of entries) {
     const { orgId, meetingId } = parseIndexEntry(entry);
     const key = presenceKey(orgId, meetingId);
-    const stale = await redis.zrangebyscore(key, "-inf", cutoff);
-    if (stale.length > 0) {
-      await redis.zrem(key, ...stale);
-      for (const userId of stale) reaped.push({ orgId, meetingId, userId });
-    }
+    const stale = (await redis.eval(SWEEP_ONE_KEY_SCRIPT, 1, key, cutoff)) as string[];
+    for (const userId of stale) reaped.push({ orgId, meetingId, userId });
+
+    // Non-atomic with the script above, but harmless: SREM on an already-absent member is a
+    // no-op, so two callers both observing `remaining === 0` and both calling SREM does no harm
+    // (unlike the reaped-member report, there's no downstream "one record per event" consequence
+    // to double-report here — it's just index bookkeeping).
     const remaining = await redis.zcard(key);
     if (remaining === 0) {
       await redis.srem(presenceIndexKey(), entry);
