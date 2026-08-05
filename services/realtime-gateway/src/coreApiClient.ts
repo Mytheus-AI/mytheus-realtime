@@ -36,6 +36,16 @@
  * point. This keeps the live join/room/chat path fully working either way; only the
  * `presence-events` analytics record is affected, and it self-heals with no further code change
  * on this side the moment `core-api` ships the field.
+ *
+ * **No `X-Org-Id` header.** An earlier version of both calls below sent one, on the theory that
+ * it identified the tenant to `core-api`. Verified (by grepping every header read across
+ * `core-api` and its shared libs) that nothing on that side ever reads it — tenancy there is
+ * resolved solely from the caller's own re-verified bearer token, exactly like `org_id` in
+ * `isParticipant`'s docstring. Sending an unread header was not a security problem (an untrusted
+ * header nobody trusts is harmless), but it was a trap: it looks like it carries tenancy while
+ * being silently discarded, inviting a future "optimization" that starts trusting it, or a
+ * different route being built by copying this client's pattern into a place that isn't as
+ * careful. Removed rather than kept-and-relabeled, since nothing here reads it back either.
  */
 
 export interface IsParticipantParams {
@@ -46,7 +56,6 @@ export interface IsParticipantParams {
 }
 
 export interface PostChatParams {
-  orgId: string;
   meetingId: string;
   userId: string;
   content: string;
@@ -102,7 +111,6 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
           {
             headers: {
               Authorization: `Bearer ${bearerToken}`,
-              "X-Org-Id": orgId,
             },
           },
         );
@@ -131,13 +139,12 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
       }
     },
 
-    async postChat({ orgId, meetingId, userId, content, clientMsgId, bearerToken }) {
+    async postChat({ meetingId, userId, content, clientMsgId, bearerToken }) {
       const res = await fetchFn(`${options.baseUrl}/api/v1/chat`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           Authorization: `Bearer ${bearerToken}`,
-          "X-Org-Id": orgId,
           "Idempotency-Key": clientMsgId,
         },
         body: JSON.stringify({ meeting_id: meetingId, content, user_id: userId }),

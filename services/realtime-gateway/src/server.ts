@@ -349,7 +349,6 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
 
       try {
         await coreApiClient.postChat({
-          orgId,
           meetingId: payload.meetingId,
           userId,
           content: payload.content,

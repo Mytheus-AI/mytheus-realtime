@@ -17,10 +17,32 @@
  * The chat endpoint simulates core-api's expected dedupe-on-Idempotency-Key behavior (recording
  * only the first call per key) so tests can assert the gateway wires the key through correctly,
  * without asserting anything about core-api's own persistence, which this repo does not own.
+ *
+ * Tenancy source: real core-api resolves `org_id` solely from the caller's own re-verified
+ * bearer token — it does not read (and `coreApiClient.ts` no longer sends) an `X-Org-Id` header.
+ * This fake matches that: it decodes the `org_id` claim out of the JWT in the `Authorization`
+ * header (no signature verification needed here — this is a test double, not a security
+ * boundary) rather than trusting any header.
  */
 import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+
+/** Decodes (without verifying) the `org_id` claim from a `Bearer <jwt>` Authorization header —
+ * mirrors what real core-api's `tenant_context()` does with the verified token, minus the
+ * verification this fake doesn't need. */
+function clerkOrgIdFromAuthHeader(authHeader: string | undefined): string | null {
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : undefined;
+  const payloadSegment = token?.split(".")[1];
+  if (!payloadSegment) return null;
+  try {
+    const json = Buffer.from(payloadSegment, "base64url").toString("utf8");
+    const claims = JSON.parse(json) as { org_id?: unknown };
+    return typeof claims.org_id === "string" ? claims.org_id : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface RecordedChatCall {
   orgId: string | null;
@@ -42,8 +64,8 @@ export interface FakeCoreApi {
   baseUrl: string;
   /**
    * Registers `(orgId, meetingId, userId)` — the Clerk-native identity the gateway sends on the
-   * wire (`X-Org-Id` header, Clerk user id in the path) — as an allowed participant. `resolved`
-   * controls what the 200 response body contains; see this file's header comment.
+   * wire (org_id claim inside the JWT, Clerk user id in the path) — as an allowed participant.
+   * `resolved` controls what the 200 response body contains; see this file's header comment.
    */
   allowParticipant(orgId: string, meetingId: string, userId: string, resolved?: ResolvedIdentity): void;
   chatCalls: RecordedChatCall[];
@@ -62,7 +84,7 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
       const match = /^\/api\/v1\/meetings\/([^/]+)\/participants\/([^/]+)$/.exec(url.pathname);
       if (match) {
         const [, meetingId, userId] = match;
-        const orgId = req.headers["x-org-id"];
+        const orgId = clerkOrgIdFromAuthHeader(req.headers.authorization);
         const resolved = allowed.get(`${String(orgId)}:${meetingId}:${userId}`);
         if (!resolved) {
           res.writeHead(403);
@@ -91,7 +113,7 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
           if (idempotencyKey) seenIdempotencyKeys.add(idempotencyKey);
           const parsed = JSON.parse(body || "{}") as { meeting_id: string; content: string; user_id?: string };
           chatCalls.push({
-            orgId: (req.headers["x-org-id"] as string | undefined) ?? null,
+            orgId: clerkOrgIdFromAuthHeader(req.headers.authorization),
             meetingId: parsed.meeting_id,
             userId: parsed.user_id ?? null,
             content: parsed.content,

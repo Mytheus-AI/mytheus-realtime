@@ -12,18 +12,22 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createCoreApiClient, type CoreApiClient } from "../src/coreApiClient";
 import { startFakeCoreApi, type FakeCoreApi } from "./helpers/fakeCoreApi";
+import { startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
 
 describe("coreApiClient.isParticipant — response parsing contract", () => {
   let coreApi: FakeCoreApi;
+  let jwks: FakeJwksServer;
   let client: CoreApiClient;
 
   beforeAll(async () => {
     coreApi = await startFakeCoreApi();
+    jwks = await startFakeJwksServer();
     client = createCoreApiClient({ baseUrl: coreApi.baseUrl });
   });
 
   afterAll(async () => {
     await coreApi.close();
+    await jwks.close();
   });
 
   it("resolves { allowed: true, internalUserId, internalOrgId } from a 200 response that includes both", async () => {
@@ -33,8 +37,12 @@ describe("coreApiClient.isParticipant — response parsing contract", () => {
     const resolvedOrgId = randomUUID();
     const resolvedUserId = randomUUID();
     coreApi.allowParticipant(orgId, meetingId, userId, { orgId: resolvedOrgId, userId: resolvedUserId });
+    // core-api resolves tenancy solely from the caller's own re-verified bearer token (no
+    // X-Org-Id header — see coreApiClient.ts's header comment), so the fake needs a real JWT
+    // carrying this test's orgId, not a placeholder string.
+    const bearerToken = await jwks.signToken({ orgId, userId });
 
-    const result = await client.isParticipant({ orgId, meetingId, userId, bearerToken: "t" });
+    const result = await client.isParticipant({ orgId, meetingId, userId, bearerToken });
 
     expect(result).toEqual({ allowed: true, internalUserId: resolvedUserId, internalOrgId: resolvedOrgId });
   });
@@ -45,18 +53,21 @@ describe("coreApiClient.isParticipant — response parsing contract", () => {
     const userId = `user-${randomUUID()}`;
     const resolvedUserId = randomUUID();
     coreApi.allowParticipant(orgId, meetingId, userId, { orgId: null, userId: resolvedUserId });
+    const bearerToken = await jwks.signToken({ orgId, userId });
 
-    const result = await client.isParticipant({ orgId, meetingId, userId, bearerToken: "t" });
+    const result = await client.isParticipant({ orgId, meetingId, userId, bearerToken });
 
     expect(result).toEqual({ allowed: true, internalUserId: resolvedUserId, internalOrgId: null });
   });
 
   it("resolves { allowed: false } on a 403 (not a participant)", async () => {
+    const orgId = `org-${randomUUID()}`;
+    const bearerToken = await jwks.signToken({ orgId, userId: "user-x" });
     const result = await client.isParticipant({
-      orgId: "org-x",
+      orgId,
       meetingId: "meeting-x",
       userId: "user-x", // never registered via allowParticipant
-      bearerToken: "t",
+      bearerToken,
     });
 
     expect(result).toEqual({ allowed: false });
