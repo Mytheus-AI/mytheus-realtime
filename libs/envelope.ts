@@ -53,3 +53,64 @@ export function buildEnvelopeHeader(input: BuildEnvelopeHeaderInput): EventEnvel
     causation_id: input.causationId ?? null,
   };
 }
+
+/**
+ * Dead-letter wrapper for poison messages, mirrored field-for-field from
+ * `mytheus-events/contracts/DlqEnvelope.avsc` (same cross-repo-import rationale as
+ * `EventEnvelopeHeader` above). One shared schema, paired with every topic's `<topic>.dlq`.
+ */
+export interface DlqEnvelope {
+  original_topic: string;
+  original_partition: number;
+  original_offset: number;
+  org_id: string;
+  idempotency_key: string;
+  consumer_group: string;
+  failure_class: "DESERIALIZE" | "SCHEMA_INCOMPAT" | "BUSINESS_INVALID" | "MAX_RETRIES";
+  error: string;
+  attempts: number;
+  /** Microseconds since the Unix epoch (UTC) — matches the Avro `timestamp-micros` logical type. */
+  first_seen_at: number;
+  raw_value_b64: string;
+}
+
+export interface BuildDlqEnvelopeInput {
+  originalTopic: string;
+  orgId: string;
+  idempotencyKey: string;
+  /**
+   * `DlqEnvelope.consumer_group` is defined for the consumer-side poison-message case (see
+   * `mytheus-events` CLAUDE.md §"The delivery contract"). `mytheus-events` pairs exactly one
+   * shared `DlqEnvelope` schema with every topic's `.dlq`, and adding a producer-specific DLQ
+   * schema would be a canon change this task cannot make. A producer-side DLQ write (this
+   * function's only caller today, for `presence-events` produce failures) therefore reuses this
+   * field to name the failing producer component instead of a consumer group.
+   */
+  consumerGroup: string;
+  failureClass: "DESERIALIZE" | "SCHEMA_INCOMPAT" | "BUSINESS_INVALID" | "MAX_RETRIES";
+  error: string;
+  attempts: number;
+  /** The value that failed to produce, as a JSON-serializable object (pre-Avro-encode) — captured
+   * this way, not as encoded bytes, because Avro encoding itself may be what failed. */
+  rawValueJson: unknown;
+  /** Override for tests; defaults to now, in microseconds. */
+  firstSeenAtMicros?: number;
+}
+
+export function buildDlqEnvelope(input: BuildDlqEnvelopeInput): DlqEnvelope {
+  return {
+    original_topic: input.originalTopic,
+    // Sentinels, not real values: a producer-side failure means the record was never actually
+    // written, so it has no real partition/offset — those only exist once a broker assigns them.
+    original_partition: -1,
+    original_offset: -1,
+    org_id: input.orgId,
+    idempotency_key: input.idempotencyKey,
+    consumer_group: input.consumerGroup,
+    failure_class: input.failureClass,
+    error: input.error,
+    attempts: input.attempts,
+    first_seen_at: input.firstSeenAtMicros ?? Date.now() * 1000,
+    raw_value_b64: Buffer.from(JSON.stringify(input.rawValueJson), "utf8").toString("base64"),
+  };
+}

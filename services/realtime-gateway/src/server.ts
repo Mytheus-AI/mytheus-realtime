@@ -22,7 +22,7 @@ import { Namespace, Server, type Socket } from "socket.io";
 import { createClerkJwtVerifier, type ClerkJwtVerifier } from "../../../libs/auth";
 import { presenceKey, pubsubChannel, roomName } from "../../../libs/keys";
 import { createCoreApiClient, type CoreApiClient } from "./coreApiClient";
-import { addPresence, removePresence } from "./presence";
+import { heartbeat, listPresence, removeMember, sweepStalePresence } from "./presence";
 import { createPresenceEventsProducer, type PresenceEventsProducer } from "./presenceEventsProducer";
 
 // ---- Socket.io event contract (namespace `/v1`) ----------------------------------------------
@@ -46,7 +46,12 @@ import { createPresenceEventsProducer, type PresenceEventsProducer } from "./pre
 //                                          forwarded verbatim from the explicit pubsub channel.
 //
 // Disconnect: presence is removed from every meeting the socket had joined, "presence" is
-// re-broadcast per meeting, and a "leave" `presence-events` record is produced per meeting.
+// re-broadcast per meeting, and a "leave" `presence-events` record is produced per meeting. This
+// is the GRACEFUL path — it requires this process to still be alive to run it. Presence is also
+// heartbeated (see `heartbeatIntervalMs`) and periodically swept (see `sweepIntervalMs`) so that a
+// pod that dies without running `disconnect` at all (SIGKILL, OOM-kill, eviction) still has its
+// presence entries expire from reads quickly and get physically reaped — and a "leave" event
+// produced — by whichever pod survives to run the next sweep.
 
 export interface JoinPayload {
   meetingId: string;
@@ -69,6 +74,8 @@ interface SocketData {
   userId: string;
   bearerToken: string;
   joinedMeetings: Set<string>;
+  /** One heartbeat interval per joined meeting, so it can be cleared on leave/disconnect. */
+  heartbeatTimers: Map<string, NodeJS.Timeout>;
 }
 
 export interface AppConfig {
@@ -78,6 +85,15 @@ export interface AppConfig {
   coreApiUrl: string;
   redpandaBrokers: string[];
   schemaRegistryUrl: string;
+  /** How often a joined socket refreshes its own presence heartbeat. Production default 15s. */
+  presenceHeartbeatIntervalMs?: number;
+  /** A member with no heartbeat in this long is treated as gone by reads (`listPresence`) and
+   * eventually reaped by the sweep. Should be a small multiple of the heartbeat interval so a
+   * couple of missed beats (not one) triggers it. Production default 45s. */
+  presenceStaleAfterMs?: number;
+  /** How often the reconciliation sweep runs, reaping stale entries left behind by a pod that
+   * died without running its `disconnect` handler. Production default 20s. */
+  presenceSweepIntervalMs?: number;
 }
 
 export interface AppDeps {
@@ -101,7 +117,15 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   const coreApiClient = deps.coreApiClient ?? createCoreApiClient({ baseUrl: config.coreApiUrl, logger });
   const presenceEventsProducer =
     deps.presenceEventsProducer ??
-    createPresenceEventsProducer({ brokers: config.redpandaBrokers, schemaRegistryUrl: config.schemaRegistryUrl });
+    createPresenceEventsProducer({
+      brokers: config.redpandaBrokers,
+      schemaRegistryUrl: config.schemaRegistryUrl,
+      logger,
+    });
+
+  const heartbeatIntervalMs = config.presenceHeartbeatIntervalMs ?? 15_000;
+  const staleAfterMs = config.presenceStaleAfterMs ?? 45_000;
+  const sweepIntervalMs = config.presenceSweepIntervalMs ?? 20_000;
 
   const httpServer = createServer((req, res) => {
     if (req.url === "/healthz") {
@@ -140,6 +164,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       data.userId = identity.userId;
       data.bearerToken = token as string;
       data.joinedMeetings = new Set();
+      data.heartbeatTimers = new Map();
       next();
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : err }, "handshake rejected");
@@ -222,7 +247,20 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       data.joinedMeetings.add(meetingId);
       await subscribeCaptionChannel(orgId, meetingId);
 
-      const members = await addPresence(pubClient, orgId, meetingId, userId);
+      await heartbeat(pubClient, orgId, meetingId, userId);
+      // Keep this member's heartbeat fresh for as long as the socket stays joined to this
+      // meeting, so an abrupt death of THIS pod doesn't leave a permanently-live-looking ghost —
+      // see presence.ts's module doc and the sweep started in start() below.
+      data.heartbeatTimers.set(
+        meetingId,
+        setInterval(() => {
+          heartbeat(pubClient, orgId, meetingId, userId).catch((err: unknown) => {
+            logger.error({ err, orgId, meetingId, userId }, "presence heartbeat failed");
+          });
+        }, heartbeatIntervalMs),
+      );
+
+      const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
       nsp.to(roomName(orgId, meetingId)).emit("presence", members);
       ack?.({ ok: true, presence: members });
 
@@ -275,8 +313,11 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     socket.on("disconnect", async () => {
       const data = socket.data as SocketData;
       for (const meetingId of data.joinedMeetings) {
+        clearInterval(data.heartbeatTimers.get(meetingId));
+        data.heartbeatTimers.delete(meetingId);
         try {
-          const members = await removePresence(pubClient, orgId, meetingId, userId);
+          await removeMember(pubClient, orgId, meetingId, userId);
+          const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
           nsp.to(roomName(orgId, meetingId)).emit("presence", members);
           await unsubscribeCaptionChannel(orgId, meetingId);
           await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
@@ -287,12 +328,39 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     });
   });
 
+  // Reconciliation sweep: reaps presence entries whose owning pod died without running its
+  // `disconnect` handler (SIGKILL, OOM-kill, eviction — see presence.ts's module doc). Runs on
+  // every pod independently; a meeting with no locally-connected socket on THIS pod can still have
+  // its abandoned entries reaped here, which is the whole point — the pod that owned the dead
+  // socket is, by definition, not around to clean up after itself.
+  async function runPresenceSweep(): Promise<void> {
+    const reaped = await sweepStalePresence(pubClient, staleAfterMs);
+    for (const { orgId, meetingId, userId } of reaped) {
+      logger.warn(
+        { orgId, meetingId, userId },
+        "reaped a stale presence entry (its owning pod likely died without a clean disconnect)",
+      );
+      const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
+      nsp.to(roomName(orgId, meetingId)).emit("presence", members);
+      try {
+        await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
+      } catch (err) {
+        logger.error({ err, orgId, meetingId, userId }, "failed to produce presence-events (leave, from sweep)");
+      }
+    }
+  }
+
+  let sweepTimer: NodeJS.Timeout | undefined;
+
   return {
     httpServer,
     io,
     nsp,
     async start() {
       await presenceEventsProducer.connect();
+      sweepTimer = setInterval(() => {
+        runPresenceSweep().catch((err: unknown) => logger.error({ err }, "presence sweep failed"));
+      }, sweepIntervalMs);
       await new Promise<void>((resolve) => {
         if (config.wsBindHost) {
           httpServer.listen(config.port, config.wsBindHost, resolve);
@@ -302,6 +370,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       });
     },
     async stop() {
+      clearInterval(sweepTimer);
       await new Promise<void>((resolve) => io.close(() => resolve()));
       await presenceEventsProducer.disconnect();
       pubClient.disconnect();
@@ -311,6 +380,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   };
 }
 
+/** Exposed for tests that want to drive the sweep directly against a real Redis without spinning
+ * up a whole App (see presence.ts for the underlying mechanics). */
+export { sweepStalePresence } from "./presence";
+
 export function loadConfigFromEnv(): AppConfig {
   return {
     port: Number(process.env.PORT ?? 8090),
@@ -319,7 +392,20 @@ export function loadConfigFromEnv(): AppConfig {
     coreApiUrl: process.env.CORE_API_URL ?? "http://localhost:8000",
     redpandaBrokers: (process.env.REDPANDA_BROKERS ?? "localhost:9092").split(","),
     schemaRegistryUrl: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8081",
+    // Optional operational tuning; unset means "use the production default" (see AppConfig doc
+    // comments). Exposed via env mainly so tests can drive fast heartbeat/stale/sweep cycles
+    // against a real spawned process instead of waiting out the multi-second production defaults.
+    presenceHeartbeatIntervalMs: envInt("PRESENCE_HEARTBEAT_INTERVAL_MS"),
+    presenceStaleAfterMs: envInt("PRESENCE_STALE_AFTER_MS"),
+    presenceSweepIntervalMs: envInt("PRESENCE_SWEEP_INTERVAL_MS"),
   };
+}
+
+function envInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 // Also exported so key builders stay reachable from this module for anything that only imports

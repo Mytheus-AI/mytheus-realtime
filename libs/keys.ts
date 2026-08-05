@@ -39,3 +39,14 @@ export function presenceKey(orgId: string, meetingId: string): string {
 export function roomName(orgId: string, meetingId: string): string {
   return `meeting:${orgId}:${meetingId}`;
 }
+
+/**
+ * Internal bookkeeping key: a Redis SET of `{org_id}|{meeting_id}` pairs that currently have at
+ * least one live presence entry. Not a tenant-facing key and not itself frozen by canon — it
+ * exists purely so the presence reconciliation sweep (see `src/presence.ts`) can find every
+ * meeting with live presence without a full `SCAN` over `nexus:*:presence:*`. `_internal` can
+ * never collide with a real `org_id` (those are UUIDs).
+ */
+export function presenceIndexKey(): string {
+  return "nexus:_internal:presence-index";
+}
