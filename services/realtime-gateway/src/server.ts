@@ -6,9 +6,12 @@
  * verified Clerk JWT only — never from the client payload — and fails closed. Room join is
  * deny-by-default via a `core-api` participant check. Presence lives only in Redis and is mirrored
  * to the `presence-events` topic. Chat is relayed over the socket and durably written by
- * `core-api`. The caption path is a transport seam only in this task: it relays whatever a
- * non-Socket.io publisher puts on the explicit `nexus:{org_id}:pubsub:meeting:{meeting_id}`
- * channel — nothing publishes there yet (that lands with `transcription-service` later).
+ * `core-api`. Captions (Task 8) are bridged live from `transcription-service`'s publish on the
+ * explicit `nexus:{org_id}:pubsub:meeting:{meeting_id}` channel to the room's sockets — scoped
+ * per-socket by that literal channel, not by Socket.io room membership (see the caption-relay
+ * comment below for why that distinction is load-bearing for tenant isolation). This gateway
+ * holds no caption state: nothing is buffered, and a reconnecting client is never replayed
+ * anything it missed.
  *
  * Run: npm run build && npm start
  */
@@ -53,8 +56,28 @@ import { createPresenceEventsProducer, type PresenceEventsProducer } from "./pre
 //                                       out of scope for the presence-events fix this file's
 //                                       history refers to, flagged as a related follow-up rather
 //                                       than silently left inconsistent.
-//   "caption" ({ meetingId, payload })  — transport only in this task; `payload` is opaque JSON
-//                                          forwarded verbatim from the explicit pubsub channel.
+//   "caption" ({ meetingId, payload })  — forwarded verbatim (Task 8) from `transcription-
+//                                          service`'s publish on the explicit pubsub channel.
+//                                          `payload` is `{ chunkId, speakerId, startMs, endMs,
+//                                          text, isFinal, confidence }` (transcription-
+//                                          service's `captions.py`), forwarded byte-for-byte —
+//                                          this file does not read or interpret any field of it.
+//                                          A client tells an interim from a final by `isFinal`;
+//                                          `chunkId` is stable across an utterance's interim
+//                                          revisions and its own final, which is what lets a
+//                                          client replace-in-place by `chunkId` until `isFinal`
+//                                          arrives, then append. EVERY caption — interim or
+//                                          final — is delivered via a normal, reliable
+//                                          `socket.emit`, never intentionally dropped: this
+//                                          repo's own CLAUDE.md pitfalls list is explicit
+//                                          ("never drop captions or confirmed agent output" —
+//                                          the thing to shed under backpressure is
+//                                          `agent-stream` token deltas, a different, not-yet-
+//                                          built feature, not captions of either kind). NO
+//                                          caption is ever buffered or replayed by this
+//                                          gateway — a reconnecting client gets nothing from
+//                                          before it (re)joined; finals are re-hydrated from
+//                                          core-api's REST read model, never from this socket.
 //
 // Disconnect: presence is removed from every meeting the socket had joined, "presence" is
 // re-broadcast per meeting, and a "leave" `presence-events` record is produced per meeting. This
@@ -94,14 +117,14 @@ interface SocketData {
   /**
    * The identity actually used for presence storage (Redis) and `presence-events` production.
    * Set once, on the socket's first successful join, from core-api's participant-check response
-   * (see `coreApiClient.ts`). `presenceUserId` is always the resolved internal `users.id` UUID.
-   * `presenceOrgId` is the resolved internal `organizations.id` UUID once core-api's response
-   * includes it, falling back to the Clerk `orgId` claim only while it doesn't (see
-   * `coreApiClient.ts`'s CONTRACT GAP note) — this fallback keeps join/presence/room fully
-   * functional either way; it can never reintroduce the original bug because
-   * `presenceEventsProducer.produce()` itself refuses to emit anything that isn't UUID-shaped.
-   * Initialized to `""` in the handshake middleware (never read before a successful join sets
-   * it for real — `joinedMeetings` only gains entries after that point).
+   * (see `coreApiClient.ts`). Both fields are the resolved internal `users.id`/`organizations.id`
+   * UUIDs on essentially every real join today. `presenceOrgId` still falls back to the Clerk
+   * `orgId` claim on the rare response that lacks it (see `coreApiClient.ts`'s "Identity
+   * resolution" note) — kept as a safety net, not because that's expected — which keeps
+   * join/presence/room fully functional either way; it can never reintroduce the original bug
+   * because `presenceEventsProducer.produce()` itself refuses to emit anything that isn't
+   * UUID-shaped. Initialized to `""` in the handshake middleware (never read before a successful
+   * join sets it for real — `joinedMeetings` only gains entries after that point).
    */
   presenceOrgId: string;
   presenceUserId: string;
@@ -203,15 +226,35 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     }
   });
 
-  // Reference-counted local subscriptions to the explicit caption channel, one per meeting room
-  // that has at least one locally-connected socket. Every gateway pod that has subscribed
-  // receives the raw pub/sub message independently (that is what plain Redis pub/sub does), so
-  // the handler below emits with `.local` — routing this back through the Socket.io adapter's
-  // own cross-pod broadcast would deliver the same caption once per subscribed pod per client.
-  const localRoomRefcounts = new Map<string, number>();
+  // Local sockets currently subscribed to each explicit caption channel, keyed by the FULL
+  // channel string (which embeds org_id, not just meeting_id). One Set per (org_id, meeting_id)
+  // pair that has at least one locally-connected socket.
+  //
+  // Why per-socket tracking instead of `nsp.local.to(roomName(meetingId)).emit(...)`: the
+  // Socket.io ROOM for a meeting is keyed by `meeting_id` ALONE (Task 6, libs/keys.ts's
+  // `roomName` — the real authz boundary is the join-time participant check, not the room
+  // name). The pubsub CHANNEL a caption arrives on is still org-scoped
+  // (`nexus:{org_id}:pubsub:meeting:{meeting_id}`). If caption fan-out were keyed off room
+  // membership, two sockets from DIFFERENT orgs whose meetings happened to share the literal
+  // same `meeting_id` (a real risk to design against, even though core-api mints meeting_id as
+  // a globally-unique UUID and a true collision is not expected in practice — see the brief)
+  // would both be sitting in the SAME room, and a caption published on org A's channel would
+  // fan out to org B's socket too. Delivering directly to the sockets that subscribed via that
+  // literal channel — never touching room membership at all — makes that leak structurally
+  // impossible rather than dependent on meeting_id uniqueness holding. See
+  // test/captions.test.ts's "zero cross-tenant caption delivery" test, which reproduces the
+  // leak against the room-based version of this code and proves this version closes it.
+  //
+  // Every gateway pod that has subscribed to a channel receives the raw pub/sub message
+  // independently (that is what plain Redis pub/sub does) and only ever touches ITS OWN local
+  // sockets here — there is no cross-pod re-broadcast in this path, so no double-delivery risk
+  // the way there would be routing this through the Socket.io adapter's own broadcast.
+  const localChannelSockets = new Map<string, Set<Socket>>();
 
   captionSubClient.on("message", (channel: string, raw: string) => {
-    let msg: { type?: string; payload?: unknown };
+    const localSockets = localChannelSockets.get(channel);
+    if (!localSockets || localSockets.size === 0) return;
+    let msg: { type?: string; meetingId?: unknown; payload?: unknown };
     try {
       msg = JSON.parse(raw);
     } catch {
@@ -219,33 +262,48 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       return;
     }
     if (msg.type !== "caption") return;
-    const match = /^nexus:(.+):pubsub:meeting:(.+)$/.exec(channel);
-    if (!match) return;
-    // `org_id` (match[1]) only distinguishes which explicit channel matched — the room name is
-    // meeting-only (see libs/keys.ts's roomName doc comment), so it isn't needed past this point.
-    const [, , meetingId] = match;
-    nsp.local.to(roomName(meetingId)).emit("caption", { meetingId, payload: msg.payload });
+    const meetingId = typeof msg.meetingId === "string" ? msg.meetingId : extractMeetingId(channel);
+    if (meetingId === null) return;
+    const outbound = { meetingId, payload: msg.payload };
+    // Every caption — interim or final — is delivered via a normal, reliable emit. This repo's
+    // own CLAUDE.md pitfalls list is explicit and unqualified: "never drop captions or confirmed
+    // agent output"; the thing to shed under backpressure is `agent-stream` token deltas (a
+    // separate, not-yet-built feature in this repo — see Task 6's report), not captions of
+    // either kind. An interim being superseded by its own next revision (same `chunkId`) is a
+    // reason a CLIENT may discard a stale one it still has buffered once a newer one arrives,
+    // never a reason this gateway may skip sending one.
+    for (const socket of localSockets) {
+      socket.emit("caption", outbound);
+    }
   });
 
-  async function subscribeCaptionChannel(orgId: string, meetingId: string): Promise<void> {
+  function extractMeetingId(channel: string): string | null {
+    const match = /^nexus:(.+):pubsub:meeting:(.+)$/.exec(channel);
+    return match ? match[2] : null;
+  }
+
+  async function subscribeCaptionChannel(orgId: string, meetingId: string, socket: Socket): Promise<void> {
     const channel = pubsubChannel(orgId, meetingId);
-    const next = (localRoomRefcounts.get(channel) ?? 0) + 1;
-    localRoomRefcounts.set(channel, next);
-    if (next === 1) {
+    let localSockets = localChannelSockets.get(channel);
+    if (!localSockets) {
+      localSockets = new Set();
+      localChannelSockets.set(channel, localSockets);
+    }
+    const isNewChannel = localSockets.size === 0;
+    localSockets.add(socket);
+    if (isNewChannel) {
       await captionSubClient.subscribe(channel);
     }
   }
 
-  async function unsubscribeCaptionChannel(orgId: string, meetingId: string): Promise<void> {
+  async function unsubscribeCaptionChannel(orgId: string, meetingId: string, socket: Socket): Promise<void> {
     const channel = pubsubChannel(orgId, meetingId);
-    const current = localRoomRefcounts.get(channel) ?? 0;
-    if (current <= 1) {
-      localRoomRefcounts.delete(channel);
-      if (current === 1) {
-        await captionSubClient.unsubscribe(channel);
-      }
-    } else {
-      localRoomRefcounts.set(channel, current - 1);
+    const localSockets = localChannelSockets.get(channel);
+    if (!localSockets) return;
+    localSockets.delete(socket);
+    if (localSockets.size === 0) {
+      localChannelSockets.delete(channel);
+      await captionSubClient.unsubscribe(channel);
     }
   }
 
@@ -285,7 +343,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
 
       socket.join(roomName(meetingId));
       data.joinedMeetings.add(meetingId);
-      await subscribeCaptionChannel(data.presenceOrgId, meetingId);
+      await subscribeCaptionChannel(data.presenceOrgId, meetingId, socket);
 
       await heartbeat(pubClient, data.presenceOrgId, meetingId, data.presenceUserId);
       // Keep this member's heartbeat fresh for as long as the socket stays joined to this
@@ -369,7 +427,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
           await removeMember(pubClient, data.presenceOrgId, meetingId, data.presenceUserId);
           const members = await listPresence(pubClient, data.presenceOrgId, meetingId, staleAfterMs);
           nsp.to(roomName(meetingId)).emit("presence", members);
-          await unsubscribeCaptionChannel(data.presenceOrgId, meetingId);
+          await unsubscribeCaptionChannel(data.presenceOrgId, meetingId, socket);
           await presenceEventsProducer.produce({
             orgId: data.presenceOrgId,
             meetingId,
