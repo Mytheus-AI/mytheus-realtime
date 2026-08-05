@@ -131,6 +131,36 @@ async def process_utterance(
     is_final` branch never touches `session_factory` or the outbox at all) and for a
     duplicate final; returns a `FinalWriteResult` only for a genuinely new final write."""
     if not utterance.is_final:
+        # Interim captions publish `utterance.text` RAW -- redaction never runs on this path
+        # at all, not even computed. This is deliberate, decided on review (not an oversight
+        # of where the redact() call happened to sit): PII redaction's job, per plan 3.5, is
+        # to keep PII out of what OUTLIVES the meeting -- `transcript_chunks`, the
+        # `transcript-chunks` topic, and everything downstream of it (embedding-service,
+        # agent-runtime-service, search-service). Interims never reach any of that: they are
+        # never persisted, never produced (this function's whole reason to exist), and gone
+        # from every browser's memory the moment the connection drops or the utterance
+        # finalizes. Redacting them would protect a surface redaction was never meant to
+        # cover -- every participant in the meeting already heard the speaker say the words
+        # out loud in real time; the caption is a transcription of speech already disclosed
+        # to that exact audience, not a new disclosure. It would also cost a second/third
+        # redaction pass per utterance (once per interim revision) on the p95 < 2 s live
+        # captions SLO for zero corresponding protection.
+        #
+        # Finals are NOT "at-rest only" despite the plan's framing suggesting that scope: the
+        # final's OWN caption emission below uses `text_override=text_value`, the ALREADY
+        # REDACTED text, not `utterance.text` -- so the live caption for a final and the
+        # persisted row show the identical redacted text, with no flash of raw PII before the
+        # utterance settles. Only interims are ever unredacted, and only because they never
+        # graduate into anything redaction is meant to protect.
+        #
+        # Follow-up, not solved here: this assumes every tenant's compliance posture treats
+        # "at rest" as the redaction boundary, matching plan 3.5/12's framing. A tenant whose
+        # posture treats the live plane itself as in-scope (the caption still traverses
+        # realtime-gateway and lands in browser memory, even if briefly) would need a
+        # DIFFERENT default than this service ships today -- e.g. a second tenant_settings
+        # flag distinct from pii_redaction_enabled, gating the live-caption path
+        # independently. No such flag exists; this is a real gap for that case, not an
+        # oversight to silently assume away.
         if redis is not None:
             await publish_caption(redis, org_id=org_id, meeting_id=meeting_id, utterance=utterance)
         return None
