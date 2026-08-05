@@ -1,55 +1,349 @@
 /**
- * realtime-gateway: the Socket.io WebSocket fan-out plane (scaffold).
+ * realtime-gateway: the Socket.io WebSocket fan-out plane.
  *
- * Boots an HTTP server with `/healthz` and a Socket.io server wired to the Redis adapter for
- * cross-instance fan-out. A bus event lands on one pod; that pod publishes on the
- * `nexus:{org_id}:pubsub:meeting:{meeting_id}` Redis channel and every subscribed pod emits to
- * its local sockets in the meeting room. Redpanda consume of `agent-stream`/`agent-results`/
- * `notifications` and the `presence-events` producer land in the realtime band.
+ * Boots an HTTP server with `/healthz` and a Socket.io server (namespace `/v1`) wired to the
+ * Redis adapter for cross-instance fan-out. Handshake authz resolves `org_id`/`user_id` from a
+ * verified Clerk JWT only — never from the client payload — and fails closed. Room join is
+ * deny-by-default via a `core-api` participant check. Presence lives only in Redis and is mirrored
+ * to the `presence-events` topic. Chat is relayed over the socket and durably written by
+ * `core-api`. The caption path is a transport seam only in this task: it relays whatever a
+ * non-Socket.io publisher puts on the explicit `nexus:{org_id}:pubsub:meeting:{meeting_id}`
+ * channel — nothing publishes there yet (that lands with `transcription-service` later).
  *
  * Run: npm run build && npm start
  */
-
-import { createServer } from "node:http";
+import { createServer, type Server as HttpServer } from "node:http";
 
 import { createAdapter } from "@socket.io/redis-adapter";
 import { Redis } from "ioredis";
-import { Server } from "socket.io";
+import pino, { type Logger } from "pino";
+import { Namespace, Server, type Socket } from "socket.io";
 
-import { pubsubChannel } from "./keys";
+import { createClerkJwtVerifier, type ClerkJwtVerifier } from "../../../libs/auth";
+import { presenceKey, pubsubChannel, roomName } from "../../../libs/keys";
+import { createCoreApiClient, type CoreApiClient } from "./coreApiClient";
+import { addPresence, removePresence } from "./presence";
+import { createPresenceEventsProducer, type PresenceEventsProducer } from "./presenceEventsProducer";
 
-const PORT = Number(process.env.PORT ?? 8090);
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
+// ---- Socket.io event contract (namespace `/v1`) ----------------------------------------------
+//
+// Client -> server:
+//   "join" ({ meetingId: string }, ack?: (res: JoinAck) => void)
+//     Joins the room for `meetingId` if the JWT-resolved `org_id`/`user_id` passes the core-api
+//     participant check; deny-by-default otherwise. Always resolves via `ack` (never throws to
+//     the client): { ok: true, presence: string[] } | { ok: false, error: "FORBIDDEN" |
+//     "INVALID_PAYLOAD" }. On success, also broadcasts "presence" to the room (see below).
+//   "chat" ({ meetingId: string, content: string, clientMsgId: string })
+//     Requires a prior successful "join" for that `meetingId` on this socket (else silently
+//     dropped). Broadcasts "chat" to the room immediately, then durably persists via `core-api`
+//     POST /api/v1/chat with `Idempotency-Key: clientMsgId`.
+//
+// Server -> client (broadcast to the room `meeting:{orgId}:{meetingId}`):
+//   "presence" (string[])            — full current member list (`user_id`s), sent on every
+//                                       join/leave transition in that room.
+//   "chat" ({ meetingId, userId, content, clientMsgId })
+//   "caption" ({ meetingId, payload })  — transport only in this task; `payload` is opaque JSON
+//                                          forwarded verbatim from the explicit pubsub channel.
+//
+// Disconnect: presence is removed from every meeting the socket had joined, "presence" is
+// re-broadcast per meeting, and a "leave" `presence-events` record is produced per meeting.
 
-const httpServer = createServer((req, res) => {
-  if (req.url === "/healthz") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", service: "realtime-gateway" }));
-    return;
-  }
-  res.writeHead(404);
-  res.end();
-});
+export interface JoinPayload {
+  meetingId: string;
+}
 
-const io = new Server(httpServer, { path: "/socket.io" });
+export interface JoinAck {
+  ok: boolean;
+  presence?: string[];
+  error?: "FORBIDDEN" | "INVALID_PAYLOAD";
+}
 
-// Cross-instance fan-out via Redis. lazyConnect + error handlers keep the process (and /healthz)
-// alive even when Redis is unreachable in dev; the adapter reconnects when Redis comes up.
-const pubClient = new Redis(REDIS_URL, { lazyConnect: true });
-const subClient = pubClient.duplicate();
-pubClient.on("error", (err) => console.error("[redis:pub]", err.message));
-subClient.on("error", (err) => console.error("[redis:sub]", err.message));
-io.adapter(createAdapter(pubClient, subClient, { key: "nexus" }));
+export interface ChatPayload {
+  meetingId: string;
+  content: string;
+  clientMsgId: string;
+}
 
-io.on("connection", (socket) => {
-  // Room join, presence sets, and the three WS flows land in the realtime band.
-  // Scaffold only accepts the connection so the transport contract exists.
-  socket.on("disconnect", () => {
-    /* presence cleanup lands in the realtime band */
+interface SocketData {
+  orgId: string;
+  userId: string;
+  bearerToken: string;
+  joinedMeetings: Set<string>;
+}
+
+export interface AppConfig {
+  port: number;
+  wsBindHost?: string;
+  redisUrl: string;
+  coreApiUrl: string;
+  redpandaBrokers: string[];
+  schemaRegistryUrl: string;
+}
+
+export interface AppDeps {
+  /** Required: no default, because there is no live Clerk instance to default against. */
+  jwtVerifier: ClerkJwtVerifier;
+  coreApiClient?: CoreApiClient;
+  presenceEventsProducer?: PresenceEventsProducer;
+  logger?: Logger;
+}
+
+export interface App {
+  httpServer: HttpServer;
+  io: Server;
+  nsp: Namespace;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export function createApp(config: AppConfig, deps: AppDeps): App {
+  const logger = deps.logger ?? pino({ name: "realtime-gateway" });
+  const coreApiClient = deps.coreApiClient ?? createCoreApiClient({ baseUrl: config.coreApiUrl, logger });
+  const presenceEventsProducer =
+    deps.presenceEventsProducer ??
+    createPresenceEventsProducer({ brokers: config.redpandaBrokers, schemaRegistryUrl: config.schemaRegistryUrl });
+
+  const httpServer = createServer((req, res) => {
+    if (req.url === "/healthz") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", service: "realtime-gateway" }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
   });
-});
 
-httpServer.listen(PORT, () => {
-  const example = pubsubChannel("<org_id>", "<meeting_id>");
-  console.log(`realtime-gateway listening on :${PORT} (fan-out channel form: ${example})`);
-});
+  const io = new Server(httpServer, { path: "/socket.io" });
+
+  // Cross-instance fan-out via Redis. lazyConnect + error handlers keep the process (and
+  // /healthz) alive even when Redis is unreachable; the adapter reconnects when Redis returns.
+  const pubClient = new Redis(config.redisUrl, { lazyConnect: true });
+  const subClient = pubClient.duplicate();
+  // A third, independent connection subscribed to the *explicit* canonical channel (see
+  // libs/keys.ts) for non-Socket.io publishers. This is separate from the adapter's own pub/sub
+  // (subClient above), which is a private implementation detail of `@socket.io/redis-adapter`.
+  const captionSubClient = pubClient.duplicate();
+  pubClient.on("error", (err) => logger.error({ err }, "redis pub client error"));
+  subClient.on("error", (err) => logger.error({ err }, "redis sub client error"));
+  captionSubClient.on("error", (err) => logger.error({ err }, "redis caption-sub client error"));
+  io.adapter(createAdapter(pubClient, subClient, { key: "nexus" }));
+
+  const nsp = io.of("/v1");
+
+  // Handshake: org_id ONLY from the Clerk JWT, never from the client payload. Fail closed.
+  nsp.use(async (socket, next) => {
+    const token = socket.handshake.auth?.token as string | undefined;
+    try {
+      const identity = await deps.jwtVerifier.verify(token);
+      const data = socket.data as SocketData;
+      data.orgId = identity.orgId;
+      data.userId = identity.userId;
+      data.bearerToken = token as string;
+      data.joinedMeetings = new Set();
+      next();
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : err }, "handshake rejected");
+      next(new Error("UNAUTHENTICATED"));
+    }
+  });
+
+  // Reference-counted local subscriptions to the explicit caption channel, one per meeting room
+  // that has at least one locally-connected socket. Every gateway pod that has subscribed
+  // receives the raw pub/sub message independently (that is what plain Redis pub/sub does), so
+  // the handler below emits with `.local` — routing this back through the Socket.io adapter's
+  // own cross-pod broadcast would deliver the same caption once per subscribed pod per client.
+  const localRoomRefcounts = new Map<string, number>();
+
+  captionSubClient.on("message", (channel: string, raw: string) => {
+    let msg: { type?: string; payload?: unknown };
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      logger.warn({ channel }, "discarding malformed message on caption channel");
+      return;
+    }
+    if (msg.type !== "caption") return;
+    const match = /^nexus:(.+):pubsub:meeting:(.+)$/.exec(channel);
+    if (!match) return;
+    const [, orgId, meetingId] = match;
+    nsp.local.to(roomName(orgId, meetingId)).emit("caption", { meetingId, payload: msg.payload });
+  });
+
+  async function subscribeCaptionChannel(orgId: string, meetingId: string): Promise<void> {
+    const channel = pubsubChannel(orgId, meetingId);
+    const next = (localRoomRefcounts.get(channel) ?? 0) + 1;
+    localRoomRefcounts.set(channel, next);
+    if (next === 1) {
+      await captionSubClient.subscribe(channel);
+    }
+  }
+
+  async function unsubscribeCaptionChannel(orgId: string, meetingId: string): Promise<void> {
+    const channel = pubsubChannel(orgId, meetingId);
+    const current = localRoomRefcounts.get(channel) ?? 0;
+    if (current <= 1) {
+      localRoomRefcounts.delete(channel);
+      if (current === 1) {
+        await captionSubClient.unsubscribe(channel);
+      }
+    } else {
+      localRoomRefcounts.set(channel, current - 1);
+    }
+  }
+
+  nsp.on("connection", (socket: Socket) => {
+    const { orgId, userId } = socket.data as SocketData;
+    logger.info({ orgId, userId, socketId: socket.id }, "socket connected");
+
+    socket.on("join", async (payload: JoinPayload, ack?: (res: JoinAck) => void) => {
+      const meetingId = payload?.meetingId;
+      if (typeof meetingId !== "string" || meetingId.length === 0) {
+        ack?.({ ok: false, error: "INVALID_PAYLOAD" });
+        return;
+      }
+      const data = socket.data as SocketData;
+
+      // Deny-by-default: a socket may only join a meeting room within its own JWT-resolved
+      // org_id. This check is the actual enforcement point; `roomName` embedding org_id is
+      // defense in depth on top of it, not a substitute for it.
+      const allowed = await coreApiClient.isParticipant({
+        orgId,
+        meetingId,
+        userId,
+        bearerToken: data.bearerToken,
+      });
+      if (!allowed) {
+        logger.warn({ orgId, userId, meetingId }, "join denied (not a participant, or cross-org attempt)");
+        ack?.({ ok: false, error: "FORBIDDEN" });
+        return;
+      }
+
+      socket.join(roomName(orgId, meetingId));
+      data.joinedMeetings.add(meetingId);
+      await subscribeCaptionChannel(orgId, meetingId);
+
+      const members = await addPresence(pubClient, orgId, meetingId, userId);
+      nsp.to(roomName(orgId, meetingId)).emit("presence", members);
+      ack?.({ ok: true, presence: members });
+
+      try {
+        await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "join" });
+      } catch (err) {
+        logger.error({ err, orgId, meetingId, userId }, "failed to produce presence-events (join)");
+      }
+    });
+
+    socket.on("chat", async (payload: ChatPayload) => {
+      const data = socket.data as SocketData;
+      if (
+        typeof payload?.meetingId !== "string" ||
+        typeof payload?.content !== "string" ||
+        typeof payload?.clientMsgId !== "string"
+      ) {
+        return;
+      }
+      if (!data.joinedMeetings.has(payload.meetingId)) {
+        logger.warn(
+          { orgId, userId, meetingId: payload.meetingId },
+          "chat dropped: socket has not joined this meeting",
+        );
+        return;
+      }
+
+      // Fan out now (low latency); the durable write is a core-api call, not a local write.
+      nsp.to(roomName(orgId, payload.meetingId)).emit("chat", {
+        meetingId: payload.meetingId,
+        userId,
+        content: payload.content,
+        clientMsgId: payload.clientMsgId,
+      });
+
+      try {
+        await coreApiClient.postChat({
+          orgId,
+          meetingId: payload.meetingId,
+          userId,
+          content: payload.content,
+          clientMsgId: payload.clientMsgId,
+          bearerToken: data.bearerToken,
+        });
+      } catch (err) {
+        logger.error({ err, orgId, meetingId: payload.meetingId }, "core-api chat persistence call failed");
+      }
+    });
+
+    socket.on("disconnect", async () => {
+      const data = socket.data as SocketData;
+      for (const meetingId of data.joinedMeetings) {
+        try {
+          const members = await removePresence(pubClient, orgId, meetingId, userId);
+          nsp.to(roomName(orgId, meetingId)).emit("presence", members);
+          await unsubscribeCaptionChannel(orgId, meetingId);
+          await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
+        } catch (err) {
+          logger.error({ err, orgId, meetingId, userId }, "presence cleanup failed on disconnect");
+        }
+      }
+    });
+  });
+
+  return {
+    httpServer,
+    io,
+    nsp,
+    async start() {
+      await presenceEventsProducer.connect();
+      await new Promise<void>((resolve) => {
+        if (config.wsBindHost) {
+          httpServer.listen(config.port, config.wsBindHost, resolve);
+        } else {
+          httpServer.listen(config.port, resolve);
+        }
+      });
+    },
+    async stop() {
+      await new Promise<void>((resolve) => io.close(() => resolve()));
+      await presenceEventsProducer.disconnect();
+      pubClient.disconnect();
+      subClient.disconnect();
+      captionSubClient.disconnect();
+    },
+  };
+}
+
+export function loadConfigFromEnv(): AppConfig {
+  return {
+    port: Number(process.env.PORT ?? 8090),
+    wsBindHost: process.env.WS_BIND_HOST,
+    redisUrl: process.env.REDIS_URL ?? "redis://localhost:6379",
+    coreApiUrl: process.env.CORE_API_URL ?? "http://localhost:8000",
+    redpandaBrokers: (process.env.REDPANDA_BROKERS ?? "localhost:9092").split(","),
+    schemaRegistryUrl: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8081",
+  };
+}
+
+// Also exported so key builders stay reachable from this module for anything that only imports
+// `./server`; the canonical implementation lives in libs/keys.ts.
+export { presenceKey, pubsubChannel, roomName };
+
+if (require.main === module) {
+  const config = loadConfigFromEnv();
+  const clerkJwksUrl = process.env.CLERK_JWKS_URL;
+  if (!clerkJwksUrl) {
+    throw new Error("CLERK_JWKS_URL is required (fail closed: no default JWKS source)");
+  }
+  const jwtVerifier = createClerkJwtVerifier({ jwksUrl: clerkJwksUrl });
+  const app = createApp(config, { jwtVerifier });
+  app
+    .start()
+    .then(() => {
+      const example = pubsubChannel("<org_id>", "<meeting_id>");
+      // eslint-disable-next-line no-console
+      console.log(`realtime-gateway listening on :${config.port} (fan-out channel form: ${example})`);
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("realtime-gateway failed to start", err);
+      process.exit(1);
+    });
+}
