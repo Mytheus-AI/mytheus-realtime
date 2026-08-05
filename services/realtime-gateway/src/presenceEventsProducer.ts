@@ -30,13 +30,18 @@
  *
  * UUID validation before producing: `header.org_id` and `payload.user_id` are typed as the Avro
  * `uuid` logical type, and `core-api`'s consumer re-asserts that at read time and DLQs anything
- * that isn't (`presence-events` previously shipped with raw Clerk ids in both fields — an opaque
- * string like `"org_2abc..."`, never a UUID — which is exactly what made every single message
- * poison; see `coreApiClient.ts`'s header comment for the full story and `server.ts` for where
- * the resolved-or-not-yet-resolved identity is threaded in). `produce()` validates both ids are
- * UUID-shaped and, if not, skips producing entirely (logs a warning, resolves normally, never
- * throws) instead of ever emitting a record the consumer's own contract test already proves will
- * be poisoned. This is the single enforcement point for every caller (join, disconnect, and the
+ * that isn't (`presence-events` once shipped with raw Clerk ids in both fields — an opaque string
+ * like `"org_2abc..."`, never a UUID — which is exactly what made every single message poison;
+ * see `coreApiClient.ts`'s header comment for the full story and `server.ts` for where the
+ * resolved identity is threaded in — non-null on essentially every real join since
+ * `mytheus-backend` commit `ca9a8db`). `produce()` still validates both ids are UUID-shaped and,
+ * if not, skips producing entirely (logs a warning, resolves normally, never throws) instead of
+ * ever emitting a record the consumer's own contract test already proves will be poisoned — kept
+ * as a safety net against a future regression on the upstream side, not because the gap is
+ * expected to still be open. A record built from an unresolved id was never structurally valid
+ * input for this schema, so refusing to emit it at all (rather than dead-lettering a "successful"
+ * produce) is the correct contract on its own merits, independent of whether the gap is open or
+ * closed. This is the single enforcement point for every caller (join, disconnect, and the
  * presence-reconciliation sweep all call this same `produce()`), so none of them need their own
  * copy of this check.
  */

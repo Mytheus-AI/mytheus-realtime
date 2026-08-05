@@ -73,19 +73,21 @@ describe("realtime-gateway handshake + room join + presence + chat + captions", 
     socket.close();
   });
 
-  it("degrades gracefully when core-api's participant-check response has no org_id yet: join/presence stay fully functional, falling back to the Clerk org_id for storage only", async () => {
+  it("degrades gracefully on a response with no org_id (regression guard — core-api's real response always includes it since mytheus-backend commit ca9a8db): join/presence stay fully functional, falling back to the Clerk org_id for storage only", async () => {
     // core-api's REAL UUID-validation skip (so a Clerk id is never actually emitted to Kafka) is
     // proven separately and thoroughly in presence-events-producer.test.ts, against the real
     // producer — the fake used here just records whatever it's given, so this test's job is
     // narrower and specific to server.ts: prove the join/presence path degrades gracefully (still
-    // succeeds) and that what it falls back to, when core-api hasn't resolved org_id yet, is
-    // exactly the Clerk org_id — never anything else, and never something that silently breaks.
+    // succeeds) and that what it falls back to, if core-api's response were ever missing org_id
+    // again (a future regression, not today's reality), is exactly the Clerk org_id — never
+    // anything else, and never something that silently breaks.
     const orgId = `org-${randomUUID()}`;
     const meetingId = `meeting-${randomUUID()}`;
     const userId = `user-${randomUUID()}`;
     const resolvedUserId = randomUUID();
-    // Simulates today's real core-api: user_id is resolved, org_id is not (see coreApiClient.ts's
-    // CONTRACT GAP note).
+    // Forces the fake into the shape core-api's response used to have before it shipped org_id
+    // (see coreApiClient.ts's "Identity resolution" note) — a regression test, not a simulation
+    // of current reality.
     t.coreApi.allowParticipant(orgId, meetingId, userId, { orgId: null, userId: resolvedUserId });
 
     const token = await t.jwks.signToken({ orgId, userId });

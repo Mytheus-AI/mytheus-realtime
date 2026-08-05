@@ -47,7 +47,7 @@ describe("coreApiClient.isParticipant — response parsing contract", () => {
     expect(result).toEqual({ allowed: true, internalUserId: resolvedUserId, internalOrgId: resolvedOrgId });
   });
 
-  it("resolves { allowed: true, internalOrgId: null } when core-api's response has no org_id field yet (today's real contract gap)", async () => {
+  it("resolves { allowed: true, internalOrgId: null } when core-api's response has no org_id field (regression guard — core-api has shipped this field since mytheus-backend commit ca9a8db, but this parsing path stays covered)", async () => {
     const orgId = `org-${randomUUID()}`;
     const meetingId = `meeting-${randomUUID()}`;
     const userId = `user-${randomUUID()}`;

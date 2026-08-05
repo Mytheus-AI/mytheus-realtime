@@ -4,15 +4,15 @@
  * loopback port — `coreApiClient.ts`'s `fetch` calls hit it for real, so the request shape
  * (headers, body, Idempotency-Key) is genuinely exercised, not mocked at the client boundary.
  *
- * The participant-check response mirrors core-api's real contract (`Participant`, per
- * `mytheus-backend`'s `services/core_api/schemas.py`): a JSON body with `user_id` (core-api's
- * resolved internal UUID for the caller — always present) and, once core-api ships the field
- * this repo's producer-side fix is waiting on (see `coreApiClient.ts`'s header comment), `org_id`
- * (the resolved internal UUID for the tenant). `allowParticipant`'s `resolved` parameter lets a
- * test model either state: omit it to simulate "core-api has already shipped both fields" (the
- * default, so existing call sites get realistic UUID-shaped resolved ids for free), or pass
- * `{ orgId: null }` to simulate "org_id isn't in the response yet" and exercise the gateway's
- * graceful-degradation path.
+ * The participant-check response mirrors core-api's real contract (`ParticipantCheck`, per
+ * `mytheus-backend`'s `services/core_api/schemas.py`, commit `ca9a8db`): a JSON body with
+ * `user_id` (core-api's resolved internal UUID for the caller) and `org_id` (the resolved
+ * internal UUID for the tenant) — both non-null on a real `allowed` response today.
+ * `allowParticipant`'s `resolved` parameter lets a test model either state: omit it to simulate
+ * "both fields present" (the default, so existing call sites get realistic UUID-shaped resolved
+ * ids for free — this is what a real call gets today), or pass `{ orgId: null }` as a regression
+ * guard for the gateway's graceful-degradation path in case a future response is ever missing it
+ * again.
  *
  * The chat endpoint simulates core-api's expected dedupe-on-Idempotency-Key behavior (recording
  * only the first call per key) so tests can assert the gateway wires the key through correctly,
