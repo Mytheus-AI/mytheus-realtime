@@ -94,7 +94,10 @@ describe("presence-events production against the real broker", () => {
       const orgId = randomUUID();
       const meetingId = randomUUID();
       const userId = randomUUID();
-      coreApi.allowParticipant(orgId, meetingId, userId);
+      // Already valid UUIDs here (this test is about the Kafka contract, not about proving the
+      // identity-resolution fallback — that's covered in gateway.test.ts and coreApiClient's own
+      // tests), so resolve identity-mapped: what core-api "resolves" to is the same value.
+      coreApi.allowParticipant(orgId, meetingId, userId, { orgId, userId });
 
       const token = await jwks.signToken({ orgId, userId });
       const socket = await connectClient(baseUrl, token);

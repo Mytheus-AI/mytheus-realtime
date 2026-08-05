@@ -38,10 +38,21 @@ import { createPresenceEventsProducer, type PresenceEventsProducer } from "./pre
 //     dropped). Broadcasts "chat" to the room immediately, then durably persists via `core-api`
 //     POST /api/v1/chat with `Idempotency-Key: clientMsgId`.
 //
-// Server -> client (broadcast to the room `meeting:{orgId}:{meetingId}`):
-//   "presence" (string[])            — full current member list (`user_id`s), sent on every
-//                                       join/leave transition in that room.
-//   "chat" ({ meetingId, userId, content, clientMsgId })
+// Server -> client (broadcast to the room `meeting:{meetingId}`):
+//   "presence" (string[])            — full current member list, sent on every join/leave
+//                                       transition in that room. CONTRACT NOTE: these are
+//                                       core-api's internal `users.id` UUIDs (resolved from the
+//                                       participant check on join), NOT the Clerk `sub` claim —
+//                                       this changed from an earlier version of this contract
+//                                       that put the raw Clerk id here; see coreApiClient.ts's
+//                                       header comment. Matches ChatMessage.user_id's shape from
+//                                       core-api's POST /chat response, unlike the "chat" event
+//                                       below, which still carries the Clerk id (see its note).
+//   "chat" ({ meetingId, userId, content, clientMsgId }) — `userId` here is still the Clerk `sub`
+//                                       from the sender's JWT, not resolved to an internal UUID;
+//                                       out of scope for the presence-events fix this file's
+//                                       history refers to, flagged as a related follow-up rather
+//                                       than silently left inconsistent.
 //   "caption" ({ meetingId, payload })  — transport only in this task; `payload` is opaque JSON
 //                                          forwarded verbatim from the explicit pubsub channel.
 //
@@ -70,12 +81,30 @@ export interface ChatPayload {
 }
 
 interface SocketData {
+  /** From the JWT `org_id` claim — Clerk's opaque org id, NOT a UUID. Used only for the trust
+   * boundary (deny-by-default authz) and forwarded to core-api, which resolves it server-side.
+   * Never use this for presence storage or presence-events — see `presenceOrgId`. */
   orgId: string;
+  /** From the JWT `sub` claim — Clerk's user id, NOT a UUID. Same caveat as `orgId`. */
   userId: string;
   bearerToken: string;
   joinedMeetings: Set<string>;
   /** One heartbeat interval per joined meeting, so it can be cleared on leave/disconnect. */
   heartbeatTimers: Map<string, NodeJS.Timeout>;
+  /**
+   * The identity actually used for presence storage (Redis) and `presence-events` production.
+   * Set once, on the socket's first successful join, from core-api's participant-check response
+   * (see `coreApiClient.ts`). `presenceUserId` is always the resolved internal `users.id` UUID.
+   * `presenceOrgId` is the resolved internal `organizations.id` UUID once core-api's response
+   * includes it, falling back to the Clerk `orgId` claim only while it doesn't (see
+   * `coreApiClient.ts`'s CONTRACT GAP note) — this fallback keeps join/presence/room fully
+   * functional either way; it can never reintroduce the original bug because
+   * `presenceEventsProducer.produce()` itself refuses to emit anything that isn't UUID-shaped.
+   * Initialized to `""` in the handshake middleware (never read before a successful join sets
+   * it for real — `joinedMeetings` only gains entries after that point).
+   */
+  presenceOrgId: string;
+  presenceUserId: string;
 }
 
 export interface AppConfig {
@@ -165,6 +194,8 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       data.bearerToken = token as string;
       data.joinedMeetings = new Set();
       data.heartbeatTimers = new Map();
+      data.presenceOrgId = "";
+      data.presenceUserId = "";
       next();
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : err }, "handshake rejected");
@@ -190,8 +221,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     if (msg.type !== "caption") return;
     const match = /^nexus:(.+):pubsub:meeting:(.+)$/.exec(channel);
     if (!match) return;
-    const [, orgId, meetingId] = match;
-    nsp.local.to(roomName(orgId, meetingId)).emit("caption", { meetingId, payload: msg.payload });
+    // `org_id` (match[1]) only distinguishes which explicit channel matched — the room name is
+    // meeting-only (see libs/keys.ts's roomName doc comment), so it isn't needed past this point.
+    const [, , meetingId] = match;
+    nsp.local.to(roomName(meetingId)).emit("caption", { meetingId, payload: msg.payload });
   });
 
   async function subscribeCaptionChannel(orgId: string, meetingId: string): Promise<void> {
@@ -229,45 +262,63 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       const data = socket.data as SocketData;
 
       // Deny-by-default: a socket may only join a meeting room within its own JWT-resolved
-      // org_id. This check is the actual enforcement point; `roomName` embedding org_id is
-      // defense in depth on top of it, not a substitute for it.
-      const allowed = await coreApiClient.isParticipant({
+      // org_id. This check is the actual enforcement point; the participant-check response also
+      // carries core-api's resolved internal identity — see coreApiClient.ts's header comment.
+      const check = await coreApiClient.isParticipant({
         orgId,
         meetingId,
         userId,
         bearerToken: data.bearerToken,
       });
-      if (!allowed) {
+      if (!check.allowed) {
         logger.warn({ orgId, userId, meetingId }, "join denied (not a participant, or cross-org attempt)");
         ack?.({ ok: false, error: "FORBIDDEN" });
         return;
       }
 
-      socket.join(roomName(orgId, meetingId));
-      data.joinedMeetings.add(meetingId);
-      await subscribeCaptionChannel(orgId, meetingId);
+      // Presence storage and presence-events use this resolved identity, never the raw JWT
+      // claims above — see SocketData's doc comment and presenceEventsProducer.ts's UUID guard,
+      // which is what makes the org fallback here safe (it can only ever cause a skip, never a
+      // repeat of the original bug).
+      data.presenceOrgId = check.internalOrgId ?? orgId;
+      data.presenceUserId = check.internalUserId;
 
-      await heartbeat(pubClient, orgId, meetingId, userId);
+      socket.join(roomName(meetingId));
+      data.joinedMeetings.add(meetingId);
+      await subscribeCaptionChannel(data.presenceOrgId, meetingId);
+
+      await heartbeat(pubClient, data.presenceOrgId, meetingId, data.presenceUserId);
       // Keep this member's heartbeat fresh for as long as the socket stays joined to this
       // meeting, so an abrupt death of THIS pod doesn't leave a permanently-live-looking ghost —
       // see presence.ts's module doc and the sweep started in start() below.
       data.heartbeatTimers.set(
         meetingId,
         setInterval(() => {
-          heartbeat(pubClient, orgId, meetingId, userId).catch((err: unknown) => {
-            logger.error({ err, orgId, meetingId, userId }, "presence heartbeat failed");
+          heartbeat(pubClient, data.presenceOrgId, meetingId, data.presenceUserId).catch((err: unknown) => {
+            logger.error(
+              { err, orgId: data.presenceOrgId, meetingId, userId: data.presenceUserId },
+              "presence heartbeat failed",
+            );
           });
         }, heartbeatIntervalMs),
       );
 
-      const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
-      nsp.to(roomName(orgId, meetingId)).emit("presence", members);
+      const members = await listPresence(pubClient, data.presenceOrgId, meetingId, staleAfterMs);
+      nsp.to(roomName(meetingId)).emit("presence", members);
       ack?.({ ok: true, presence: members });
 
       try {
-        await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "join" });
+        await presenceEventsProducer.produce({
+          orgId: data.presenceOrgId,
+          meetingId,
+          userId: data.presenceUserId,
+          eventType: "join",
+        });
       } catch (err) {
-        logger.error({ err, orgId, meetingId, userId }, "failed to produce presence-events (join)");
+        logger.error(
+          { err, orgId: data.presenceOrgId, meetingId, userId: data.presenceUserId },
+          "failed to produce presence-events (join)",
+        );
       }
     });
 
@@ -289,7 +340,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       }
 
       // Fan out now (low latency); the durable write is a core-api call, not a local write.
-      nsp.to(roomName(orgId, payload.meetingId)).emit("chat", {
+      nsp.to(roomName(payload.meetingId)).emit("chat", {
         meetingId: payload.meetingId,
         userId,
         content: payload.content,
@@ -316,13 +367,21 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
         clearInterval(data.heartbeatTimers.get(meetingId));
         data.heartbeatTimers.delete(meetingId);
         try {
-          await removeMember(pubClient, orgId, meetingId, userId);
-          const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
-          nsp.to(roomName(orgId, meetingId)).emit("presence", members);
-          await unsubscribeCaptionChannel(orgId, meetingId);
-          await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
+          await removeMember(pubClient, data.presenceOrgId, meetingId, data.presenceUserId);
+          const members = await listPresence(pubClient, data.presenceOrgId, meetingId, staleAfterMs);
+          nsp.to(roomName(meetingId)).emit("presence", members);
+          await unsubscribeCaptionChannel(data.presenceOrgId, meetingId);
+          await presenceEventsProducer.produce({
+            orgId: data.presenceOrgId,
+            meetingId,
+            userId: data.presenceUserId,
+            eventType: "leave",
+          });
         } catch (err) {
-          logger.error({ err, orgId, meetingId, userId }, "presence cleanup failed on disconnect");
+          logger.error(
+            { err, orgId: data.presenceOrgId, meetingId, userId: data.presenceUserId },
+            "presence cleanup failed on disconnect",
+          );
         }
       }
     });
@@ -341,7 +400,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
         "reaped a stale presence entry (its owning pod likely died without a clean disconnect)",
       );
       const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
-      nsp.to(roomName(orgId, meetingId)).emit("presence", members);
+      nsp.to(roomName(meetingId)).emit("presence", members);
       try {
         await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
       } catch (err) {

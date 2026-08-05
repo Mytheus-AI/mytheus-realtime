@@ -4,6 +4,8 @@
  * Uses a fake `MinimalKafkaProducer` (test/helpers/fakeKafkaProducer.ts) to make the main-topic
  * send fail deterministically, rather than needing a genuinely broken broker.
  */
+import { randomUUID } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import { createPresenceEventsProducer } from "../src/presenceEventsProducer";
@@ -20,9 +22,10 @@ describe("presenceEventsProducer DLQ routing", () => {
     });
     await producer.connect();
 
-    const orgId = "org-1";
+    const orgId = randomUUID();
+    const userId = randomUUID();
     await expect(
-      producer.produce({ orgId, meetingId: "meeting-1", userId: "user-1", eventType: "join" }),
+      producer.produce({ orgId, meetingId: "meeting-1", userId, eventType: "join" }),
     ).rejects.toThrow(/simulated broker failure/);
 
     // nothing landed on the real topic (the fake rejected it before recording)
@@ -48,7 +51,7 @@ describe("presenceEventsProducer DLQ routing", () => {
     const rawPayload = JSON.parse(Buffer.from(envelope.raw_value_b64, "base64").toString("utf8"));
     expect(rawPayload).toMatchObject({
       meeting_id: "meeting-1",
-      user_id: "user-1",
+      user_id: userId,
       event_type: "join",
       header: { org_id: orgId },
     });
@@ -64,7 +67,12 @@ describe("presenceEventsProducer DLQ routing", () => {
     });
     await producer.connect();
 
-    await producer.produce({ orgId: "org-1", meetingId: "meeting-1", userId: "user-1", eventType: "join" });
+    await producer.produce({
+      orgId: randomUUID(),
+      meetingId: "meeting-1",
+      userId: randomUUID(),
+      eventType: "join",
+    });
 
     expect(fakeProducer.sends.filter((s) => s.topic === "presence-events")).toHaveLength(1);
     expect(fakeProducer.sends.filter((s) => s.topic === "presence-events.dlq")).toHaveLength(0);
@@ -94,9 +102,35 @@ describe("presenceEventsProducer DLQ routing", () => {
     await producer.connect();
 
     await expect(
-      producer.produce({ orgId: "org-1", meetingId: "meeting-1", userId: "user-1", eventType: "join" }),
+      producer.produce({ orgId: randomUUID(), meetingId: "meeting-1", userId: randomUUID(), eventType: "join" }),
     ).rejects.toThrow(/simulated broker failure/); // the ORIGINAL error, not the DLQ error
 
     expect(errors.length).toBeGreaterThan(0);
+  });
+
+  it("skips producing (no send at all) when org_id or user_id is not UUID-shaped, and logs a warning instead of throwing", async () => {
+    // Contract-pinning test (per the identity-resolution bug fix): core-api's consumer requires
+    // both fields to be real UUIDs and DLQs anything else
+    // (tests/test_presence_events_consumer.py::test_a_non_uuid_org_id_header_is_a_poison_message
+    // in mytheus-backend). This producer must never again emit a non-UUID org_id/user_id — it
+    // should refuse before ever calling send(), not rely on the consumer to catch it.
+    const fakeProducer = createFakeKafkaProducer();
+    const warnings: unknown[] = [];
+    const producer = createPresenceEventsProducer({
+      brokers: ["unused:9092"],
+      schemaRegistryUrl: "http://unused",
+      producer: fakeProducer,
+      registry: createFakeSchemaRegistry(),
+      logger: { error: () => {}, warn: (obj) => warnings.push(obj) },
+    });
+    await producer.connect();
+
+    // a raw Clerk org id — exactly the shape that caused the original bug
+    await producer.produce({ orgId: "org_2abcNotAUuid", meetingId: "meeting-1", userId: randomUUID(), eventType: "join" });
+    // a raw Clerk user id (the JWT `sub`)
+    await producer.produce({ orgId: randomUUID(), meetingId: "meeting-1", userId: "user_alsoNotAUuid", eventType: "join" });
+
+    expect(fakeProducer.sends).toHaveLength(0);
+    expect(warnings.length).toBe(2);
   });
 });

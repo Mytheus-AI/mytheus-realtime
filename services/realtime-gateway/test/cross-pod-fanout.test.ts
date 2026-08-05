@@ -82,8 +82,10 @@ describe("cross-pod fan-out (canonical hard test — two separate processes)", (
       const meetingId = randomUUID();
       const userA = randomUUID();
       const userB = randomUUID();
-      coreApi.allowParticipant(orgId, meetingId, userA);
-      coreApi.allowParticipant(orgId, meetingId, userB);
+      // Already valid UUIDs (this test is about cross-pod delivery, not identity resolution —
+      // that's covered in gateway.test.ts), so resolve identity-mapped.
+      coreApi.allowParticipant(orgId, meetingId, userA, { orgId, userId: userA });
+      coreApi.allowParticipant(orgId, meetingId, userB, { orgId, userId: userB });
 
       const tokenA = await jwks.signToken({ orgId, userId: userA });
       const tokenB = await jwks.signToken({ orgId, userId: userB });

@@ -129,7 +129,9 @@ describe("presence survives an ungraceful pod death (real SIGKILL, two real proc
       const orgId = randomUUID();
       const meetingId = randomUUID();
       const userId = randomUUID();
-      coreApi.allowParticipant(orgId, meetingId, userId);
+      // Already valid UUIDs (this test is about surviving a real SIGKILL, not identity
+      // resolution — that's covered in gateway.test.ts), so resolve identity-mapped.
+      coreApi.allowParticipant(orgId, meetingId, userId, { orgId, userId });
 
       const token = await jwks.signToken({ orgId, userId });
       const socket = await connectClient(`http://127.0.0.1:${portA}`, token);

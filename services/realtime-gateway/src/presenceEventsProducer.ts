@@ -27,6 +27,18 @@
  * an inspectable, replayable record instead of vanishing after a single log line. `produce()`
  * still rethrows the original error afterward so existing callers keep their own logging/handling
  * unchanged — the DLQ write is additive, not a replacement for that.
+ *
+ * UUID validation before producing: `header.org_id` and `payload.user_id` are typed as the Avro
+ * `uuid` logical type, and `core-api`'s consumer re-asserts that at read time and DLQs anything
+ * that isn't (`presence-events` previously shipped with raw Clerk ids in both fields — an opaque
+ * string like `"org_2abc..."`, never a UUID — which is exactly what made every single message
+ * poison; see `coreApiClient.ts`'s header comment for the full story and `server.ts` for where
+ * the resolved-or-not-yet-resolved identity is threaded in). `produce()` validates both ids are
+ * UUID-shaped and, if not, skips producing entirely (logs a warning, resolves normally, never
+ * throws) instead of ever emitting a record the consumer's own contract test already proves will
+ * be poisoned. This is the single enforcement point for every caller (join, disconnect, and the
+ * presence-reconciliation sweep all call this same `produce()`), so none of them need their own
+ * copy of this check.
  */
 import { randomUUID } from "node:crypto";
 
@@ -74,7 +86,16 @@ export interface PresenceEventsProducerOptions {
   /** Injectable for tests; production always builds a real `SchemaRegistry` from
    * `schemaRegistryUrl`. */
   registry?: MinimalSchemaRegistry;
-  logger?: { error: (obj: unknown, msg?: string) => void };
+  logger?: { error: (obj: unknown, msg?: string) => void; warn?: (obj: unknown, msg?: string) => void };
+}
+
+/** RFC 4122-shaped, version-agnostic (accepts anything Postgres/`crypto.randomUUID()` would
+ * produce). Deliberately permissive on version/variant bits — this is a wire-format guard against
+ * "not a UUID at all" (e.g. a raw Clerk id like `"org_2abc..."`), not a strict UUID validator. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
 }
 
 const TOPIC = "presence-events";
@@ -152,6 +173,17 @@ export function createPresenceEventsProducer(options: PresenceEventsProducerOpti
     async produce({ orgId, meetingId, userId, eventType }) {
       if (!connected || schemaId === undefined) {
         throw new Error("presence-events producer used before connect()");
+      }
+      // Both fields are the Avro `uuid` logical type and the consumer re-asserts that at read
+      // time (poisoning anything else) — see this file's header comment. Skip rather than ever
+      // emit a record we already know is malformed; this is a deliberate no-op, not a failure, so
+      // it does not throw and does not go through DLQ routing (there was nothing to retry).
+      if (!isUuid(orgId) || !isUuid(userId)) {
+        options.logger?.warn?.(
+          { orgId, meetingId, userId, eventType },
+          "skipping presence-events produce: org_id or user_id is not a resolved UUID yet (see coreApiClient.ts's CONTRACT GAP note)",
+        );
+        return;
       }
       const eventId = randomUUID();
       const idempotencyKey = `presence:${eventId}`;
