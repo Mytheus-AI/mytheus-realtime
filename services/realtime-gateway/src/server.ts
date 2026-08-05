@@ -41,7 +41,9 @@ import { createPresenceEventsProducer, type PresenceEventsProducer } from "./pre
 //     dropped). Broadcasts "chat" to the room immediately, then durably persists via `core-api`
 //     POST /api/v1/chat with `Idempotency-Key: clientMsgId`.
 //
-// Server -> client (broadcast to the room `meeting:{meetingId}`):
+// Server -> client (broadcast to the room `meeting:{org_id}:{meeting_id}` — org-scoped, not
+// meeting-only; this is the actual tenancy boundary for cross-pod presence/chat fan-out, see
+// libs/keys.ts's `roomName` doc comment):
 //   "presence" (string[])            — full current member list, sent on every join/leave
 //                                       transition in that room. CONTRACT NOTE: these are
 //                                       core-api's internal `users.id` UUIDs (resolved from the
@@ -230,25 +232,20 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   // channel string (which embeds org_id, not just meeting_id). One Set per (org_id, meeting_id)
   // pair that has at least one locally-connected socket.
   //
-  // Why per-socket tracking instead of `nsp.local.to(roomName(meetingId)).emit(...)`: the
-  // Socket.io ROOM for a meeting is keyed by `meeting_id` ALONE (Task 6, libs/keys.ts's
-  // `roomName` — the real authz boundary is the join-time participant check, not the room
-  // name). The pubsub CHANNEL a caption arrives on is still org-scoped
-  // (`nexus:{org_id}:pubsub:meeting:{meeting_id}`). If caption fan-out were keyed off room
-  // membership, two sockets from DIFFERENT orgs whose meetings happened to share the literal
-  // same `meeting_id` (a real risk to design against, even though core-api mints meeting_id as
-  // a globally-unique UUID and a true collision is not expected in practice — see the brief)
-  // would both be sitting in the SAME room, and a caption published on org A's channel would
-  // fan out to org B's socket too. Delivering directly to the sockets that subscribed via that
-  // literal channel — never touching room membership at all — makes that leak structurally
-  // impossible rather than dependent on meeting_id uniqueness holding. See
-  // test/captions.test.ts's "zero cross-tenant caption delivery" test, which reproduces the
-  // leak against the room-based version of this code and proves this version closes it.
-  //
-  // Every gateway pod that has subscribed to a channel receives the raw pub/sub message
-  // independently (that is what plain Redis pub/sub does) and only ever touches ITS OWN local
-  // sockets here — there is no cross-pod re-broadcast in this path, so no double-delivery risk
-  // the way there would be routing this through the Socket.io adapter's own broadcast.
+  // Why per-socket tracking here instead of `nsp.local.to(roomName(orgId, meetingId)).emit(...)`
+  // — i.e. why captions don't just use the now-org-scoped room the way presence/chat do below:
+  // the caption channel is fed by a non-Socket.io publisher (`transcription-service`) via plain
+  // Redis pub/sub, and EVERY gateway pod that has subscribed to a channel receives that raw
+  // message independently — that's what plain pub/sub does. Routing this back through
+  // `nsp.to(room)` would ALSO re-broadcast it via the Redis adapter's own internal cross-pod
+  // channels on top of that, delivering the same caption once per subscribed pod per client.
+  // Delivering directly to locally-tracked sockets (`.local` in spirit, without needing the
+  // literal flag) avoids that double-delivery. This is a delivery-mechanism reason, not a
+  // tenancy one — `roomName(orgId, meetingId)` is in fact a safe, org-scoped room now (see
+  // libs/keys.ts), and presence/chat below use it directly for exactly that reason. See
+  // test/captions.test.ts's "zero cross-tenant caption delivery" test and
+  // test/cross-tenant-room-collision.test.ts (presence/chat) for the tenant-isolation proofs on
+  // each path.
   const localChannelSockets = new Map<string, Set<Socket>>();
 
   // In-flight per-socket disconnect cleanups (see the `disconnect` handler below). Tracked so
@@ -355,7 +352,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       data.presenceOrgId = check.internalOrgId ?? orgId;
       data.presenceUserId = check.internalUserId;
 
-      socket.join(roomName(meetingId));
+      socket.join(roomName(data.presenceOrgId, meetingId));
       data.joinedMeetings.add(meetingId);
       await subscribeCaptionChannel(data.presenceOrgId, meetingId, socket);
 
@@ -376,7 +373,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       );
 
       const members = await listPresence(pubClient, data.presenceOrgId, meetingId, staleAfterMs);
-      nsp.to(roomName(meetingId)).emit("presence", members);
+      nsp.to(roomName(data.presenceOrgId, meetingId)).emit("presence", members);
       ack?.({ ok: true, presence: members });
 
       try {
@@ -412,7 +409,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       }
 
       // Fan out now (low latency); the durable write is a core-api call, not a local write.
-      nsp.to(roomName(payload.meetingId)).emit("chat", {
+      // `data.presenceOrgId` is safe to read here unconditionally: `chat` requires a prior
+      // successful `join` for this exact `meetingId` on this socket (the check above), and
+      // `presenceOrgId` is set during that same join before `joinedMeetings` gains the entry.
+      nsp.to(roomName(data.presenceOrgId, payload.meetingId)).emit("chat", {
         meetingId: payload.meetingId,
         userId,
         content: payload.content,
@@ -460,7 +460,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     try {
       await removeMember(pubClient, orgId, meetingId, userId);
       const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
-      nsp.to(roomName(meetingId)).emit("presence", members);
+      nsp.to(roomName(orgId, meetingId)).emit("presence", members);
     } catch (err) {
       logger.error({ err, orgId, meetingId, userId }, "presence removal failed on disconnect");
     }
@@ -491,7 +491,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
         "reaped a stale presence entry (its owning pod likely died without a clean disconnect)",
       );
       const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
-      nsp.to(roomName(meetingId)).emit("presence", members);
+      nsp.to(roomName(orgId, meetingId)).emit("presence", members);
       try {
         await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
       } catch (err) {
@@ -529,7 +529,21 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       // them) is what actually distinguishes a clean shutdown from a genuine mid-operation
       // failure: with this wait, a `disconnect` handler only ever sees "Connection is closed"
       // if Redis itself is genuinely down, never as an artifact of this method's own ordering.
-      await Promise.allSettled([...pendingDisconnectCleanups]);
+      //
+      // A single snapshot-then-await is correct as long as every relevant `disconnect` handler
+      // has already registered its cleanup into `pendingDisconnectCleanups` by the time the
+      // snapshot is taken — true for how `io.close()` currently closes still-connected sockets
+      // (synchronously, before its own callback fires), but that is an unstated internal
+      // ordering guarantee of Socket.io's current implementation, not something this file
+      // enforces. `Promise.allSettled` also yields to the event loop, which is exactly the kind
+      // of window a concurrently-arriving client-initiated disconnect (as opposed to one
+      // `io.close()` itself triggered) could register a NEW cleanup into after the snapshot was
+      // taken. Looping until the set is genuinely empty — re-checked right before disconnecting
+      // Redis, with no further await in between — removes the dependency on that internal
+      // ordering guarantee entirely, rather than assuming it holds.
+      while (pendingDisconnectCleanups.size > 0) {
+        await Promise.allSettled([...pendingDisconnectCleanups]);
+      }
       await presenceEventsProducer.disconnect();
       pubClient.disconnect();
       subClient.disconnect();

@@ -46,19 +46,37 @@ export function presenceKey(orgId: string, meetingId: string): string {
 }
 
 /**
- * Socket.io room name for a meeting, keyed by `meeting_id` alone — matching the canon's literal
- * "rooms keyed by `meeting_id`" (not `org_id`+`meeting_id`). `meeting_id` is a UUID minted by
- * `core-api` and never reused across tenants, so this is already tenant-safe on its own; the
- * actual authz boundary is the deny-by-default participant check on join (`src/server.ts`), not
- * the room name. An earlier version of this function also embedded `org_id` as defense in depth,
- * but that forced every caller to agree on which `org_id` REPRESENTATION to use (Clerk's claim
- * vs the resolved internal UUID — see this file's header comment), and one caller (the
- * reconciliation sweep, which reads back whatever was stored in Redis rather than a live JWT)
- * could only ever see the resolved value. A meeting-only key sidesteps that mismatch entirely
- * without weakening the actual boundary.
+ * Socket.io room name for a meeting, keyed by BOTH `org_id` and `meeting_id`.
+ *
+ * THIS IS A LOAD-BEARING TENANCY BOUNDARY, not defense in depth: `nsp.to(roomName(...))` is how
+ * `@socket.io/redis-adapter` fans presence and chat out across every gateway pod, and that
+ * fan-out reaches every socket in the named room with no further per-message check. If the room
+ * were keyed by `meeting_id` alone, two sockets from DIFFERENT orgs whose meetings happened to
+ * share a literal `meeting_id` would land in the identical room and receive each other's
+ * presence member lists (internal user UUIDs) and chat content — a real, shipped cross-tenant
+ * leak this repo hit once already for captions (a different delivery path, fixed by scoping to
+ * the org-embedded pubsub channel instead of room membership) and again for presence/chat (this
+ * fix). `meeting_id` being a `core-api`-minted UUID that is never reused across tenants makes a
+ * collision astronomically unlikely, but "unlikely" is not "structurally impossible," and the
+ * join-time participant check alone does not protect against it either: it verifies the JOINING
+ * socket's own org owns a meeting with that id, not that no OTHER org does. Org-scoping the room
+ * itself is what makes the leak structurally impossible rather than dependent on `meeting_id`
+ * uniqueness holding.
+ *
+ * A PRIOR version of this function was meeting-only, on the reasoning that org-scoping "forced
+ * every caller to agree on which `org_id` REPRESENTATION to use (Clerk's claim vs the resolved
+ * internal UUID), and one caller (the reconciliation sweep, which reads back whatever was stored
+ * in Redis rather than a live JWT) could only ever see the resolved value" — i.e. join-time and
+ * sweep-time traffic risked landing in DIFFERENT rooms for the same real meeting. That risk is
+ * gone: every caller in `src/server.ts` (join, chat, disconnect cleanup, and the sweep) now
+ * threads through the exact same single value (`SocketData.presenceOrgId`, resolved once at
+ * join and reused for everything for that socket's lifetime, including what gets written to the
+ * presence index the sweep reads back from) — there is no longer a second representation for
+ * this function's callers to disagree about. Restoring org-scoping here closes the cross-tenant
+ * gap without reintroducing the mismatch this function used to guard against.
  */
-export function roomName(meetingId: string): string {
-  return `meeting:${meetingId}`;
+export function roomName(orgId: string, meetingId: string): string {
+  return `meeting:${orgId}:${meetingId}`;
 }
 
 /**

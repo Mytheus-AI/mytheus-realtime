@@ -12,7 +12,12 @@
  * "both fields present" (the default, so existing call sites get realistic UUID-shaped resolved
  * ids for free — this is what a real call gets today), or pass `{ orgId: null }` as a regression
  * guard for the gateway's graceful-degradation path in case a future response is ever missing it
- * again.
+ * again. When `resolved.orgId` is omitted, the resolved org UUID is DETERMINISTIC per Clerk
+ * `orgId` claim (cached across every `allowParticipant` call on this fake instance), matching
+ * real core-api's actual behavior: `org_id` is resolved from the caller's own bearer token, so
+ * two different users of the same real org always get the same resolved UUID back. Two
+ * `allowParticipant` calls with the same `orgId` but no explicit `resolved.orgId` therefore
+ * land in the same tenant, as they would for real — see `resolvedOrgFor` below.
  *
  * The chat endpoint simulates core-api's expected dedupe-on-Idempotency-Key behavior (recording
  * only the first call per key) so tests can assert the gateway wires the key through correctly,
@@ -76,6 +81,25 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
   const allowed = new Map<string, Required<ResolvedIdentity>>();
   const chatCalls: RecordedChatCall[] = [];
   const seenIdempotencyKeys = new Set<string>();
+  // Fix round 2 fidelity gap: real core-api resolves `org_id` from `ctx.org_id` — the CALLER's
+  // own re-verified bearer token — so two different users of the SAME real Clerk org always get
+  // the SAME resolved internal org UUID back, deterministically, on every call. This fake used
+  // to mint a FRESH random UUID per `allowParticipant` call whenever `resolved.orgId` was
+  // omitted, so two participants of what a test intended to be "the same org" silently resolved
+  // to two DIFFERENT fake org UUIDs — invisible as long as nothing depended on room-level org
+  // consistency, but exactly the kind of test-double/reality drift that let the presence-events
+  // Clerk-id bug (Task 6) go unnoticed for as long as it did. Caching by the raw Clerk `orgId`
+  // claim (never reset between `allowParticipant` calls in one fake instance) matches real
+  // core-api's actual determinism.
+  const resolvedOrgIdByClerkOrg = new Map<string, string>();
+  function resolvedOrgFor(clerkOrgId: string): string {
+    let resolved = resolvedOrgIdByClerkOrg.get(clerkOrgId);
+    if (!resolved) {
+      resolved = randomUUID();
+      resolvedOrgIdByClerkOrg.set(clerkOrgId, resolved);
+    }
+    return resolved;
+  }
 
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? "", "http://localhost");
@@ -138,7 +162,7 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
     allowParticipant(orgId, meetingId, userId, resolved) {
       allowed.set(`${orgId}:${meetingId}:${userId}`, {
         userId: resolved?.userId ?? randomUUID(),
-        orgId: resolved?.orgId === undefined ? randomUUID() : resolved.orgId,
+        orgId: resolved?.orgId === undefined ? resolvedOrgFor(orgId) : resolved.orgId,
       });
     },
     chatCalls,
