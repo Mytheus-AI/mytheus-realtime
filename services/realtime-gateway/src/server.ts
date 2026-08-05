@@ -251,10 +251,17 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   // the way there would be routing this through the Socket.io adapter's own broadcast.
   const localChannelSockets = new Map<string, Set<Socket>>();
 
+  // In-flight per-socket disconnect cleanups (see the `disconnect` handler below). Tracked so
+  // `stop()` can wait for them to settle before disconnecting `pubClient`/`captionSubClient` —
+  // otherwise a shutdown-in-progress `io.close()` races an async disconnect handler still
+  // mid-flight against those same Redis connections, which then reject with "Connection is
+  // closed" (fix round 1: this was firing in real test teardowns, not just a hypothetical).
+  const pendingDisconnectCleanups = new Set<Promise<void>>();
+
   captionSubClient.on("message", (channel: string, raw: string) => {
     const localSockets = localChannelSockets.get(channel);
     if (!localSockets || localSockets.size === 0) return;
-    let msg: { type?: string; meetingId?: unknown; payload?: unknown };
+    let msg: { type?: string; payload?: unknown };
     try {
       msg = JSON.parse(raw);
     } catch {
@@ -262,7 +269,14 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       return;
     }
     if (msg.type !== "caption") return;
-    const meetingId = typeof msg.meetingId === "string" ? msg.meetingId : extractMeetingId(channel);
+    // `meetingId` is ALWAYS derived from the channel string, never from the message body: the
+    // channel is the authenticated fact (it's what this process subscribed to, tied to the
+    // sockets in `localSockets`); the body is untrusted JSON from a publisher this gateway does
+    // not authenticate per-message. transcription-service's captions.py does send a matching
+    // `meetingId` field in the body today, but that's an invariant of the current publisher,
+    // not something this gateway can enforce — deriving from the channel means a body/channel
+    // mismatch (bug or otherwise) can never mislabel a caption into the wrong meeting's UI.
+    const meetingId = extractMeetingId(channel);
     if (meetingId === null) return;
     const outbound = { meetingId, payload: msg.payload };
     // Every caption — interim or final — is delivered via a normal, reliable emit. This repo's
@@ -418,31 +432,51 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       }
     });
 
-    socket.on("disconnect", async () => {
+    socket.on("disconnect", () => {
       const data = socket.data as SocketData;
       for (const meetingId of data.joinedMeetings) {
         clearInterval(data.heartbeatTimers.get(meetingId));
         data.heartbeatTimers.delete(meetingId);
-        try {
-          await removeMember(pubClient, data.presenceOrgId, meetingId, data.presenceUserId);
-          const members = await listPresence(pubClient, data.presenceOrgId, meetingId, staleAfterMs);
-          nsp.to(roomName(meetingId)).emit("presence", members);
-          await unsubscribeCaptionChannel(data.presenceOrgId, meetingId, socket);
-          await presenceEventsProducer.produce({
-            orgId: data.presenceOrgId,
-            meetingId,
-            userId: data.presenceUserId,
-            eventType: "leave",
-          });
-        } catch (err) {
-          logger.error(
-            { err, orgId: data.presenceOrgId, meetingId, userId: data.presenceUserId },
-            "presence cleanup failed on disconnect",
-          );
-        }
+        const cleanup = cleanupMeetingOnDisconnect(data, meetingId, socket);
+        pendingDisconnectCleanups.add(cleanup);
+        cleanup.finally(() => pendingDisconnectCleanups.delete(cleanup));
       }
     });
   });
+
+  /**
+   * Per-meeting disconnect cleanup, split into THREE INDEPENDENT steps, each with its own
+   * try/catch, so a failure in one can never skip the others (fix round 1: the previous single
+   * shared try/catch meant a `removeMember` failure — a transient Redis blip is exactly the
+   * kind of thing that happens in production — silently skipped `unsubscribeCaptionChannel`
+   * entirely. The dead socket then stayed in `localChannelSockets`'s Set forever: a per-socket
+   * leak, and, once it was the last socket for that channel, an indefinitely-open Redis
+   * subscription to a channel nobody is listening to anymore). Step 2 (caption unsubscribe) is
+   * therefore ALWAYS attempted regardless of whether step 1 (presence) succeeded.
+   */
+  async function cleanupMeetingOnDisconnect(data: SocketData, meetingId: string, socket: Socket): Promise<void> {
+    const { presenceOrgId: orgId, presenceUserId: userId } = data;
+
+    try {
+      await removeMember(pubClient, orgId, meetingId, userId);
+      const members = await listPresence(pubClient, orgId, meetingId, staleAfterMs);
+      nsp.to(roomName(meetingId)).emit("presence", members);
+    } catch (err) {
+      logger.error({ err, orgId, meetingId, userId }, "presence removal failed on disconnect");
+    }
+
+    try {
+      await unsubscribeCaptionChannel(orgId, meetingId, socket);
+    } catch (err) {
+      logger.error({ err, orgId, meetingId }, "caption channel unsubscribe failed on disconnect");
+    }
+
+    try {
+      await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
+    } catch (err) {
+      logger.error({ err, orgId, meetingId, userId }, "failed to produce presence-events (leave, from disconnect)");
+    }
+  }
 
   // Reconciliation sweep: reaps presence entries whose owning pod died without running its
   // `disconnect` handler (SIGKILL, OOM-kill, eviction — see presence.ts's module doc). Runs on
@@ -488,6 +522,14 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     async stop() {
       clearInterval(sweepTimer);
       await new Promise<void>((resolve) => io.close(() => resolve()));
+      // `io.close()`'s own callback does not wait for each socket's async `disconnect` handler
+      // to finish (Node's EventEmitter fires listeners without awaiting them) — those handlers
+      // are still using `pubClient`/`captionSubClient` to clean up presence and caption
+      // subscriptions. Waiting for them here (rather than disconnecting Redis out from under
+      // them) is what actually distinguishes a clean shutdown from a genuine mid-operation
+      // failure: with this wait, a `disconnect` handler only ever sees "Connection is closed"
+      // if Redis itself is genuinely down, never as an artifact of this method's own ordering.
+      await Promise.allSettled([...pendingDisconnectCleanups]);
       await presenceEventsProducer.disconnect();
       pubClient.disconnect();
       subClient.disconnect();
