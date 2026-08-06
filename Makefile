@@ -2,12 +2,15 @@
 
 GW = services/realtime-gateway
 TX = services/transcription-service
+LIBS = libs
 
 install:
+	cd $(LIBS) && npm install
 	cd $(GW) && npm install
 	cd $(TX) && uv sync
 
 lint:
+	cd $(GW) && npm run lint
 	cd $(TX) && uv run ruff check . && uv run black --check .
 
 typecheck:
@@ -15,7 +18,7 @@ typecheck:
 	cd $(TX) && uv run mypy .
 
 test:
-	cd $(GW) && npm run build
+	cd $(GW) && npm run build && npm test
 	cd $(TX) && uv run pytest
 
 ci: lint typecheck test

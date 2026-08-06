@@ -7,6 +7,11 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "websockets>=12",
     "confluent-kafka[avro,schemaregistry]>=2.4",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "redis>=5.0",
+    "pydantic>=2.7",
 ]
 
 [dependency-groups]
@@ -43,3 +48,9 @@ exclude = ["tests/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# So `tests/test_partition_privileges.py` can `from migrations._partition_privileges import
+# APPLICATION_ROLES` -- `migrations/` is a top-level package (repo root, alongside `src/`),
+# not part of the installed `transcription_service` package, so it needs the repo root on
+# `sys.path` explicitly. Alembic's own `prepend_sys_path = .` in `alembic.ini` does the same
+# thing for the migration runner itself.
+pythonpath = ["."]

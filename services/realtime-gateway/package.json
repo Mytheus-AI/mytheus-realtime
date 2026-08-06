@@ -3,19 +3,33 @@
   "version": "0.1.0",
   "private": true,
   "description": "Socket.io WebSocket fan-out plane for the Mytheus real-time tier (scaffold).",
-  "main": "dist/server.js",
+  "main": "dist/services/realtime-gateway/src/server.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js",
-    "typecheck": "tsc --noEmit"
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/services/realtime-gateway/src/server.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "test": "vitest run"
   },
   "dependencies": {
+    "@kafkajs/confluent-schema-registry": "^4.1.0",
     "@socket.io/redis-adapter": "^8.3.0",
     "ioredis": "^5.4.1",
+    "jose": "^6.2.8",
+    "kafkajs": "^2.2.4",
+    "pino": "^10.3.1",
     "socket.io": "^4.8.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.0",
-    "typescript": "^5.6.3"
+    "eslint": "^10.8.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
+    "socket.io-client": "^4.8.3",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.66.0",
+    "vitest": "^4.1.10"
   }
 }

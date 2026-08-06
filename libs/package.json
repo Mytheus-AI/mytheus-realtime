@@ -1,0 +1,9 @@
+{
+  "name": "@mytheus/realtime-libs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared cross-cutting helpers for the real-time tier's Node service(s): Redis key builders, the event envelope, and Clerk JWT verification.",
+  "dependencies": {
+    "jose": "^6.2.8"
+  }
+}

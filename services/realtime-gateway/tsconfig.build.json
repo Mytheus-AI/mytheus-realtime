@@ -1,0 +1,7 @@
+{
+  // Build config: same compiler options as tsconfig.json, but excludes test/** so `dist/` only
+  // ever contains shippable service + shared-libs output. `npm run typecheck` uses the sibling
+  // tsconfig.json (which includes test/**) so the tests are still type-checked, just not built.
+  "extends": "./tsconfig.json",
+  "include": ["src/**/*.ts", "../../libs/**/*.ts"]
+}
