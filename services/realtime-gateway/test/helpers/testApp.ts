@@ -10,7 +10,10 @@ import { io as ioClient, type Socket as ClientSocket } from "socket.io-client";
 
 import { createClerkJwtVerifier } from "../../../../libs/auth";
 import { createApp, type App } from "../../src/server";
-import type { PresenceEventsProducer, ProducePresenceEventParams } from "../../src/presenceEventsProducer";
+import type {
+  PresenceEventsProducer,
+  ProducePresenceEventParams,
+} from "../../src/presenceEventsProducer";
 import { startFakeCoreApi, type FakeCoreApi } from "./fakeCoreApi";
 import { startFakeJwksServer, type FakeJwksServer } from "./fakeJwks";
 

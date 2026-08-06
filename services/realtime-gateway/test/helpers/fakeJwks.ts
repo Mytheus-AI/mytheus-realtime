@@ -61,14 +61,19 @@ export async function startFakeJwksServer(): Promise<FakeJwksServer> {
         .sign(privateKey);
     },
     async close() {
-      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) =>
+        server.close((err) => (err ? reject(err) : resolve())),
+      );
     },
   };
 }
 
 /** Signs a token with a freshly-generated keypair that was never published to any JWKS — for the
  * "signed by the wrong key" rejection case. */
-export async function signTokenWithUnpublishedKey(issuer: string, params: SignTokenParams): Promise<string> {
+export async function signTokenWithUnpublishedKey(
+  issuer: string,
+  params: SignTokenParams,
+): Promise<string> {
   const { privateKey } = await generateKeyPair("RS256");
   return signWith(privateKey, "unpublished-key", issuer, params);
 }

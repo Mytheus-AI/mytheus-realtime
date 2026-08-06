@@ -73,7 +73,7 @@ describe("App.stop() drains a concurrently-slow disconnect cleanup before discon
     inspector = new Redis(REDIS_URL);
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     process.off("unhandledRejection", onUnhandledRejection);
     vi.restoreAllMocks();
     inspector.disconnect();
@@ -81,7 +81,9 @@ describe("App.stop() drains a concurrently-slow disconnect cleanup before discon
       // Fail loudly with the actual reason(s) rather than a bare "expected 0 to be >0" — this
       // is the exact failure mode ("Connection is closed" propagating as an unhandled rejection)
       // the old single-snapshot code could theoretically produce.
-      throw new Error(`unhandled rejection(s) during test: ${unhandledRejections.map(String).join("; ")}`);
+      throw new Error(
+        `unhandled rejection(s) during test: ${unhandledRejections.map(String).join("; ")}`,
+      );
     }
   });
 
@@ -107,11 +109,16 @@ describe("App.stop() drains a concurrently-slow disconnect cleanup before discon
     const userId = `user-${randomUUID()}`;
     const resolvedOrgId = randomUUID();
     const resolvedUserId = randomUUID();
-    coreApi.allowParticipant(orgId, meetingId, userId, { orgId: resolvedOrgId, userId: resolvedUserId });
+    coreApi.allowParticipant(orgId, meetingId, userId, {
+      orgId: resolvedOrgId,
+      userId: resolvedUserId,
+    });
 
     const token = await jwks.signToken({ orgId, userId });
     const socket = await connectClient(baseUrl, token);
-    const ack = await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId }, resolve));
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socket.emit("join", { meetingId }, resolve),
+    );
     expect(ack.ok).toBe(true);
 
     // Make the presence-removal step of disconnect cleanup a REAL async gap (not an instant
@@ -147,7 +154,9 @@ describe("App.stop() drains a concurrently-slow disconnect cleanup before discon
     // The concrete symptom of the old bug: no "Connection is closed" (or similarly-shaped)
     // error surfaced anywhere in the logger during this run.
     const connectionClosedLogs = records.filter(
-      (r) => r.level === "error" && r.args.some((a) => JSON.stringify(a).includes("Connection is closed")),
+      (r) =>
+        r.level === "error" &&
+        r.args.some((a) => JSON.stringify(a).includes("Connection is closed")),
     );
     expect(connectionClosedLogs).toEqual([]);
   }, 10000);

@@ -50,7 +50,12 @@ export async function heartbeat(
 }
 
 /** Immediate, graceful removal (normal join/disconnect path — not the abnormal-death path). */
-export async function removeMember(redis: Redis, orgId: string, meetingId: string, userId: string): Promise<void> {
+export async function removeMember(
+  redis: Redis,
+  orgId: string,
+  meetingId: string,
+  userId: string,
+): Promise<void> {
   const key = presenceKey(orgId, meetingId);
   await redis.zrem(key, userId);
   const remaining = await redis.zcard(key);

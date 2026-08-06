@@ -25,7 +25,7 @@ describe("presence set (real Redis)", () => {
     redis = new Redis(REDIS_URL);
   });
 
-  afterAll(async () => {
+  afterAll(() => {
     redis.disconnect();
   });
 
@@ -38,16 +38,23 @@ describe("presence set (real Redis)", () => {
       expect(await listPresence(redis, orgId, meetingId, STALE_AFTER_MS)).toEqual([]);
 
       await heartbeat(redis, orgId, meetingId, "user-1");
-      expect((await listPresence(redis, orgId, meetingId, STALE_AFTER_MS)).sort()).toEqual(["user-1"]);
+      expect((await listPresence(redis, orgId, meetingId, STALE_AFTER_MS)).sort()).toEqual([
+        "user-1",
+      ]);
 
       await heartbeat(redis, orgId, meetingId, "user-2");
-      expect((await listPresence(redis, orgId, meetingId, STALE_AFTER_MS)).sort()).toEqual(["user-1", "user-2"]);
+      expect((await listPresence(redis, orgId, meetingId, STALE_AFTER_MS)).sort()).toEqual([
+        "user-1",
+        "user-2",
+      ]);
 
       // the key is exactly the canonical form, not some other name
       expect(await redis.zcard(key)).toBe(2);
 
       await removeMember(redis, orgId, meetingId, "user-1");
-      expect((await listPresence(redis, orgId, meetingId, STALE_AFTER_MS)).sort()).toEqual(["user-2"]);
+      expect((await listPresence(redis, orgId, meetingId, STALE_AFTER_MS)).sort()).toEqual([
+        "user-2",
+      ]);
 
       await removeMember(redis, orgId, meetingId, "user-2");
       expect(await listPresence(redis, orgId, meetingId, STALE_AFTER_MS)).toEqual([]);

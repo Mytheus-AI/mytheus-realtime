@@ -135,7 +135,8 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
         return {
           allowed: true,
           internalUserId: body.user_id,
-          internalOrgId: typeof body.org_id === "string" && body.org_id.length > 0 ? body.org_id : null,
+          internalOrgId:
+            typeof body.org_id === "string" && body.org_id.length > 0 ? body.org_id : null,
         };
       } catch (err) {
         options.logger?.warn(

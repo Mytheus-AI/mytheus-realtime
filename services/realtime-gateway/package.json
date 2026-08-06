@@ -8,6 +8,8 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/services/realtime-gateway/src/server.js",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
     "test": "vitest run"
   },
   "dependencies": {
@@ -20,9 +22,14 @@
     "socket.io": "^4.8.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.0",
+    "eslint": "^10.8.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
     "socket.io-client": "^4.8.3",
     "typescript": "^5.6.3",
+    "typescript-eslint": "^8.66.0",
     "vitest": "^4.1.10"
   }
 }

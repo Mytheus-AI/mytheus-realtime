@@ -7,7 +7,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createClerkJwtVerifier, type ClerkJwtVerifier } from "../../../libs/auth";
-import { signTokenWithUnpublishedKey, startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
+import {
+  signTokenWithUnpublishedKey,
+  startFakeJwksServer,
+  type FakeJwksServer,
+} from "./helpers/fakeJwks";
 
 describe("createClerkJwtVerifier", () => {
   let jwks: FakeJwksServer;
@@ -44,7 +48,10 @@ describe("createClerkJwtVerifier", () => {
   });
 
   it("rejects a token signed by a key not in the JWKS", async () => {
-    const token = await signTokenWithUnpublishedKey(jwks.issuer, { orgId: "org-1", userId: "user-1" });
+    const token = await signTokenWithUnpublishedKey(jwks.issuer, {
+      orgId: "org-1",
+      userId: "user-1",
+    });
     await expect(verifier.verify(token)).rejects.toThrow();
   });
 

@@ -26,7 +26,10 @@ import { createClerkJwtVerifier, type ClerkJwtVerifier } from "../../../libs/aut
 import { presenceKey, pubsubChannel, roomName } from "../../../libs/keys";
 import { createCoreApiClient, type CoreApiClient } from "./coreApiClient";
 import { heartbeat, listPresence, removeMember, sweepStalePresence } from "./presence";
-import { createPresenceEventsProducer, type PresenceEventsProducer } from "./presenceEventsProducer";
+import {
+  createPresenceEventsProducer,
+  type PresenceEventsProducer,
+} from "./presenceEventsProducer";
 
 // ---- Socket.io event contract (namespace `/v1`) ----------------------------------------------
 //
@@ -168,7 +171,8 @@ export interface App {
 
 export function createApp(config: AppConfig, deps: AppDeps): App {
   const logger = deps.logger ?? pino({ name: "realtime-gateway" });
-  const coreApiClient = deps.coreApiClient ?? createCoreApiClient({ baseUrl: config.coreApiUrl, logger });
+  const coreApiClient =
+    deps.coreApiClient ?? createCoreApiClient({ baseUrl: config.coreApiUrl, logger });
   const presenceEventsProducer =
     deps.presenceEventsProducer ??
     createPresenceEventsProducer({
@@ -260,7 +264,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     if (!localSockets || localSockets.size === 0) return;
     let msg: { type?: string; payload?: unknown };
     try {
-      msg = JSON.parse(raw);
+      msg = JSON.parse(raw) as { type?: string; payload?: unknown };
     } catch {
       logger.warn({ channel }, "discarding malformed message on caption channel");
       return;
@@ -293,7 +297,11 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     return match ? match[2] : null;
   }
 
-  async function subscribeCaptionChannel(orgId: string, meetingId: string, socket: Socket): Promise<void> {
+  async function subscribeCaptionChannel(
+    orgId: string,
+    meetingId: string,
+    socket: Socket,
+  ): Promise<void> {
     const channel = pubsubChannel(orgId, meetingId);
     let localSockets = localChannelSockets.get(channel);
     if (!localSockets) {
@@ -307,7 +315,11 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     }
   }
 
-  async function unsubscribeCaptionChannel(orgId: string, meetingId: string, socket: Socket): Promise<void> {
+  async function unsubscribeCaptionChannel(
+    orgId: string,
+    meetingId: string,
+    socket: Socket,
+  ): Promise<void> {
     const channel = pubsubChannel(orgId, meetingId);
     const localSockets = localChannelSockets.get(channel);
     if (!localSockets) return;
@@ -340,7 +352,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
         bearerToken: data.bearerToken,
       });
       if (!check.allowed) {
-        logger.warn({ orgId, userId, meetingId }, "join denied (not a participant, or cross-org attempt)");
+        logger.warn(
+          { orgId, userId, meetingId },
+          "join denied (not a participant, or cross-org attempt)",
+        );
         ack?.({ ok: false, error: "FORBIDDEN" });
         return;
       }
@@ -352,7 +367,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       data.presenceOrgId = check.internalOrgId ?? orgId;
       data.presenceUserId = check.internalUserId;
 
-      socket.join(roomName(data.presenceOrgId, meetingId));
+      await socket.join(roomName(data.presenceOrgId, meetingId));
       data.joinedMeetings.add(meetingId);
       await subscribeCaptionChannel(data.presenceOrgId, meetingId, socket);
 
@@ -363,12 +378,14 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       data.heartbeatTimers.set(
         meetingId,
         setInterval(() => {
-          heartbeat(pubClient, data.presenceOrgId, meetingId, data.presenceUserId).catch((err: unknown) => {
-            logger.error(
-              { err, orgId: data.presenceOrgId, meetingId, userId: data.presenceUserId },
-              "presence heartbeat failed",
-            );
-          });
+          heartbeat(pubClient, data.presenceOrgId, meetingId, data.presenceUserId).catch(
+            (err: unknown) => {
+              logger.error(
+                { err, orgId: data.presenceOrgId, meetingId, userId: data.presenceUserId },
+                "presence heartbeat failed",
+              );
+            },
+          );
         }, heartbeatIntervalMs),
       );
 
@@ -428,7 +445,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
           bearerToken: data.bearerToken,
         });
       } catch (err) {
-        logger.error({ err, orgId, meetingId: payload.meetingId }, "core-api chat persistence call failed");
+        logger.error(
+          { err, orgId, meetingId: payload.meetingId },
+          "core-api chat persistence call failed",
+        );
       }
     });
 
@@ -439,7 +459,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
         data.heartbeatTimers.delete(meetingId);
         const cleanup = cleanupMeetingOnDisconnect(data, meetingId, socket);
         pendingDisconnectCleanups.add(cleanup);
-        cleanup.finally(() => pendingDisconnectCleanups.delete(cleanup));
+        void cleanup.finally(() => pendingDisconnectCleanups.delete(cleanup));
       }
     });
   });
@@ -454,7 +474,11 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
    * subscription to a channel nobody is listening to anymore). Step 2 (caption unsubscribe) is
    * therefore ALWAYS attempted regardless of whether step 1 (presence) succeeded.
    */
-  async function cleanupMeetingOnDisconnect(data: SocketData, meetingId: string, socket: Socket): Promise<void> {
+  async function cleanupMeetingOnDisconnect(
+    data: SocketData,
+    meetingId: string,
+    socket: Socket,
+  ): Promise<void> {
     const { presenceOrgId: orgId, presenceUserId: userId } = data;
 
     try {
@@ -474,7 +498,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     try {
       await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
     } catch (err) {
-      logger.error({ err, orgId, meetingId, userId }, "failed to produce presence-events (leave, from disconnect)");
+      logger.error(
+        { err, orgId, meetingId, userId },
+        "failed to produce presence-events (leave, from disconnect)",
+      );
     }
   }
 
@@ -495,7 +522,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       try {
         await presenceEventsProducer.produce({ orgId, meetingId, userId, eventType: "leave" });
       } catch (err) {
-        logger.error({ err, orgId, meetingId, userId }, "failed to produce presence-events (leave, from sweep)");
+        logger.error(
+          { err, orgId, meetingId, userId },
+          "failed to produce presence-events (leave, from sweep)",
+        );
       }
     }
   }
@@ -521,7 +551,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     },
     async stop() {
       clearInterval(sweepTimer);
-      await new Promise<void>((resolve) => io.close(() => resolve()));
+      await io.close();
       // `io.close()`'s own callback does not wait for each socket's async `disconnect` handler
       // to finish (Node's EventEmitter fires listeners without awaiting them) — those handlers
       // are still using `pubClient`/`captionSubClient` to clean up presence and caption
@@ -597,7 +627,9 @@ if (require.main === module) {
     .then(() => {
       const example = pubsubChannel("<org_id>", "<meeting_id>");
       // eslint-disable-next-line no-console
-      console.log(`realtime-gateway listening on :${config.port} (fan-out channel form: ${example})`);
+      console.log(
+        `realtime-gateway listening on :${config.port} (fan-out channel form: ${example})`,
+      );
     })
     .catch((err) => {
       // eslint-disable-next-line no-console

@@ -50,7 +50,9 @@ describe("presence and chat: zero cross-tenant delivery, even when two orgs shar
     const token = await t.jwks.signToken({ orgId: params.orgId, userId: params.userId });
     const socket = await connectClient(t.baseUrl, token);
     sockets.push(socket);
-    const ack = await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId: params.meetingId }, resolve));
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socket.emit("join", { meetingId: params.meetingId }, resolve),
+    );
     expect(ack.ok).toBe(true);
     return socket;
   }
@@ -144,14 +146,22 @@ describe("presence and chat: zero cross-tenant delivery, even when two orgs shar
     socketA.on("chat", (msg: unknown) => chatOnA.push(msg));
     socketB.on("chat", (msg: unknown) => chatOnB.push(msg));
 
-    socketA.emit("chat", { meetingId: sharedMeetingId, content: "org A only", clientMsgId: randomUUID() });
+    socketA.emit("chat", {
+      meetingId: sharedMeetingId,
+      content: "org A only",
+      clientMsgId: randomUUID(),
+    });
     await waitFor(() => chatOnA.length >= 1);
     await sleep(300);
 
     expect(chatOnA).toHaveLength(1);
     expect(chatOnB).toHaveLength(0);
 
-    socketB.emit("chat", { meetingId: sharedMeetingId, content: "org B only", clientMsgId: randomUUID() });
+    socketB.emit("chat", {
+      meetingId: sharedMeetingId,
+      content: "org B only",
+      clientMsgId: randomUUID(),
+    });
     await waitFor(() => chatOnB.length >= 1);
     await sleep(300);
 

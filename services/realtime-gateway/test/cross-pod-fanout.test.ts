@@ -20,7 +20,14 @@ import { startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
-const SERVER_ENTRY = path.join(REPO_ROOT, "dist", "services", "realtime-gateway", "src", "server.js");
+const SERVER_ENTRY = path.join(
+  REPO_ROOT,
+  "dist",
+  "services",
+  "realtime-gateway",
+  "src",
+  "server.js",
+);
 
 describe("cross-pod fan-out (canonical hard test — two separate processes)", () => {
   let jwks: FakeJwksServer;
@@ -70,63 +77,63 @@ describe("cross-pod fan-out (canonical hard test — two separate processes)", (
     child.stderr?.on("data", (chunk: Buffer) => {
       // presence-events production against a slow/cold broker is non-fatal to the flows under
       // test here; surface stderr for debugging without failing the test on it.
-      process.stderr.write(`[gateway:${port}] ${chunk}`);
+      process.stderr.write(`[gateway:${port}] ${chunk.toString()}`);
     });
     return child;
   }
 
-  it(
-    "delivers presence and chat across two independent gateway processes via the Redis adapter",
-    async () => {
-      const orgId = randomUUID();
-      const meetingId = randomUUID();
-      const userA = randomUUID();
-      const userB = randomUUID();
-      // Already valid UUIDs (this test is about cross-pod delivery, not identity resolution —
-      // that's covered in gateway.test.ts), so resolve identity-mapped.
-      coreApi.allowParticipant(orgId, meetingId, userA, { orgId, userId: userA });
-      coreApi.allowParticipant(orgId, meetingId, userB, { orgId, userId: userB });
+  it("delivers presence and chat across two independent gateway processes via the Redis adapter", async () => {
+    const orgId = randomUUID();
+    const meetingId = randomUUID();
+    const userA = randomUUID();
+    const userB = randomUUID();
+    // Already valid UUIDs (this test is about cross-pod delivery, not identity resolution —
+    // that's covered in gateway.test.ts), so resolve identity-mapped.
+    coreApi.allowParticipant(orgId, meetingId, userA, { orgId, userId: userA });
+    coreApi.allowParticipant(orgId, meetingId, userB, { orgId, userId: userB });
 
-      const tokenA = await jwks.signToken({ orgId, userId: userA });
-      const tokenB = await jwks.signToken({ orgId, userId: userB });
+    const tokenA = await jwks.signToken({ orgId, userId: userA });
+    const tokenB = await jwks.signToken({ orgId, userId: userB });
 
-      const socketA = await connectClient(`http://127.0.0.1:${portA}`, tokenA);
-      const socketB = await connectClient(`http://127.0.0.1:${portB}`, tokenB);
+    const socketA = await connectClient(`http://127.0.0.1:${portA}`, tokenA);
+    const socketB = await connectClient(`http://127.0.0.1:${portB}`, tokenB);
 
-      const ackA = await new Promise<JoinAck>((resolve) => socketA.emit("join", { meetingId }, resolve));
-      expect(ackA.ok).toBe(true);
+    const ackA = await new Promise<JoinAck>((resolve) =>
+      socketA.emit("join", { meetingId }, resolve),
+    );
+    expect(ackA.ok).toBe(true);
 
-      // socket A is on process A; this presence broadcast must arrive via B's local emit after
-      // process B publishes through the adapter -- prove socket A sees userB join from process B.
-      const presenceOnA = new Promise<string[]>((resolve) => {
-        socketA.on("presence", (members: string[]) => {
-          if (members.includes(userB)) resolve(members);
-        });
+    // socket A is on process A; this presence broadcast must arrive via B's local emit after
+    // process B publishes through the adapter -- prove socket A sees userB join from process B.
+    const presenceOnA = new Promise<string[]>((resolve) => {
+      socketA.on("presence", (members: string[]) => {
+        if (members.includes(userB)) resolve(members);
       });
-      const ackB = await new Promise<JoinAck>((resolve) => socketB.emit("join", { meetingId }, resolve));
-      expect(ackB.ok).toBe(true);
+    });
+    const ackB = await new Promise<JoinAck>((resolve) =>
+      socketB.emit("join", { meetingId }, resolve),
+    );
+    expect(ackB.ok).toBe(true);
 
-      const presenceMembers = await presenceOnA;
-      expect(presenceMembers.sort()).toEqual([userA, userB].sort());
+    const presenceMembers = await presenceOnA;
+    expect(presenceMembers.sort()).toEqual([userA, userB].sort());
 
-      // now prove chat crosses the same boundary in the other direction: A -> process A -> Redis
-      // adapter -> process B -> socket B.
-      const chatOnB = new Promise((resolve) => socketB.once("chat", resolve));
-      const clientMsgId = randomUUID();
-      socketA.emit("chat", { meetingId, content: "hello from process A", clientMsgId });
+    // now prove chat crosses the same boundary in the other direction: A -> process A -> Redis
+    // adapter -> process B -> socket B.
+    const chatOnB = new Promise((resolve) => socketB.once("chat", resolve));
+    const clientMsgId = randomUUID();
+    socketA.emit("chat", { meetingId, content: "hello from process A", clientMsgId });
 
-      await expect(chatOnB).resolves.toEqual({
-        meetingId,
-        userId: userA,
-        content: "hello from process A",
-        clientMsgId,
-      });
+    await expect(chatOnB).resolves.toEqual({
+      meetingId,
+      userId: userA,
+      content: "hello from process A",
+      clientMsgId,
+    });
 
-      socketA.close();
-      socketB.close();
-    },
-    20000,
-  );
+    socketA.close();
+    socketB.close();
+  }, 20000);
 });
 
 function findFreePort(): Promise<number> {

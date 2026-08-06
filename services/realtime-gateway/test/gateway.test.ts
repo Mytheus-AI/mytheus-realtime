@@ -12,7 +12,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { pubsubChannel } from "../../../libs/keys";
 import type { JoinAck } from "../src/server";
-import { connectClient, expectConnectRejected, startTestApp, type TestApp } from "./helpers/testApp";
+import {
+  connectClient,
+  expectConnectRejected,
+  startTestApp,
+  type TestApp,
+} from "./helpers/testApp";
 
 const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
 
@@ -51,7 +56,10 @@ describe("realtime-gateway handshake + room join + presence + chat + captions", 
     // space would fail loudly rather than coincidentally passing.
     const resolvedOrgId = randomUUID();
     const resolvedUserId = randomUUID();
-    t.coreApi.allowParticipant(orgId, meetingId, userId, { orgId: resolvedOrgId, userId: resolvedUserId });
+    t.coreApi.allowParticipant(orgId, meetingId, userId, {
+      orgId: resolvedOrgId,
+      userId: resolvedUserId,
+    });
 
     const token = await t.jwks.signToken({ orgId, userId });
     const socket = await connectClient(t.baseUrl, token);
@@ -59,7 +67,9 @@ describe("realtime-gateway handshake + room join + presence + chat + captions", 
     const presenceEvents: string[][] = [];
     socket.on("presence", (members: string[]) => presenceEvents.push(members));
 
-    const ack = await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId }, resolve));
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socket.emit("join", { meetingId }, resolve),
+    );
 
     expect(ack).toEqual({ ok: true, presence: [resolvedUserId] });
     expect(presenceEvents).toEqual([[resolvedUserId]]);
@@ -93,11 +103,15 @@ describe("realtime-gateway handshake + room join + presence + chat + captions", 
     const token = await t.jwks.signToken({ orgId, userId });
     const socket = await connectClient(t.baseUrl, token);
 
-    const ack = await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId }, resolve));
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socket.emit("join", { meetingId }, resolve),
+    );
     expect(ack).toEqual({ ok: true, presence: [resolvedUserId] }); // join/presence unaffected
 
     await waitFor(() =>
-      t.presenceEventsProducer.calls.some((c) => c.meetingId === meetingId && c.eventType === "join"),
+      t.presenceEventsProducer.calls.some(
+        (c) => c.meetingId === meetingId && c.eventType === "join",
+      ),
     );
     expect(t.presenceEventsProducer.calls).toContainEqual({
       orgId, // falls back to the Clerk org_id, not silently dropped or corrupted
@@ -121,7 +135,9 @@ describe("realtime-gateway handshake + room join + presence + chat + captions", 
     const tokenB = await t.jwks.signToken({ orgId: orgB, userId: userB });
     const socketB = await connectClient(t.baseUrl, tokenB);
 
-    const ack = await new Promise<JoinAck>((resolve) => socketB.emit("join", { meetingId }, resolve));
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socketB.emit("join", { meetingId }, resolve),
+    );
     expect(ack).toEqual({ ok: false, error: "FORBIDDEN" });
 
     // deny-by-default must mean no side effects: no presence entry, no presence-events record
@@ -206,7 +222,10 @@ describe("realtime-gateway handshake + room join + presence + chat + captions", 
     // transcription-service, keys by the same internal id every other producer uses), so a
     // publisher in this test must match that, not the Clerk org_id used for the JWT/X-Org-Id.
     const resolvedOrgId = randomUUID();
-    t.coreApi.allowParticipant(orgId, meetingId, userId, { orgId: resolvedOrgId, userId: randomUUID() });
+    t.coreApi.allowParticipant(orgId, meetingId, userId, {
+      orgId: resolvedOrgId,
+      userId: randomUUID(),
+    });
 
     const token = await t.jwks.signToken({ orgId, userId });
     const socket = await connectClient(t.baseUrl, token);
@@ -239,8 +258,14 @@ describe("realtime-gateway handshake + room join + presence + chat + captions", 
     const resolvedOrgId = randomUUID();
     const resolvedStayerId = randomUUID();
     const resolvedLeaverId = randomUUID();
-    t.coreApi.allowParticipant(orgId, meetingId, stayerId, { orgId: resolvedOrgId, userId: resolvedStayerId });
-    t.coreApi.allowParticipant(orgId, meetingId, leaverId, { orgId: resolvedOrgId, userId: resolvedLeaverId });
+    t.coreApi.allowParticipant(orgId, meetingId, stayerId, {
+      orgId: resolvedOrgId,
+      userId: resolvedStayerId,
+    });
+    t.coreApi.allowParticipant(orgId, meetingId, leaverId, {
+      orgId: resolvedOrgId,
+      userId: resolvedLeaverId,
+    });
 
     const stayerToken = await t.jwks.signToken({ orgId, userId: stayerId });
     const leaverToken = await t.jwks.signToken({ orgId, userId: leaverId });

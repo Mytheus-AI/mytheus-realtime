@@ -47,7 +47,9 @@ interface CaptionMessage {
   };
 }
 
-function captionPayload(overrides: Partial<CaptionMessage["payload"]> = {}): CaptionMessage["payload"] {
+function captionPayload(
+  overrides: Partial<CaptionMessage["payload"]> = {},
+): CaptionMessage["payload"] {
   return {
     chunkId: randomUUID(),
     speakerId: "0",
@@ -92,7 +94,9 @@ describe("live caption bridge (transcription-service -> realtime-gateway -> Sock
     const token = await t.jwks.signToken({ orgId: params.orgId, userId: params.userId });
     const socket = await connectClient(t.baseUrl, token);
     sockets.push(socket);
-    const ack = await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId: params.meetingId }, resolve));
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socket.emit("join", { meetingId: params.meetingId }, resolve),
+    );
     expect(ack.ok).toBe(true);
     return socket;
   }
@@ -109,7 +113,13 @@ describe("live caption bridge (transcription-service -> realtime-gateway -> Sock
 
     const chunkId = randomUUID();
     const interim = captionPayload({ chunkId, text: "hello", isFinal: false, confidence: 0.4 });
-    const revisedInterim = captionPayload({ chunkId, text: "hello there", endMs: 900, isFinal: false, confidence: 0.6 });
+    const revisedInterim = captionPayload({
+      chunkId,
+      text: "hello there",
+      endMs: 900,
+      isFinal: false,
+      confidence: 0.6,
+    });
     const final = captionPayload({
       chunkId,
       text: "hello there, how are you",
@@ -119,11 +129,20 @@ describe("live caption bridge (transcription-service -> realtime-gateway -> Sock
     });
 
     const channel = pubsubChannel(resolvedOrgId, meetingId);
-    await publisher.publish(channel, JSON.stringify({ type: "caption", meetingId, payload: interim }));
+    await publisher.publish(
+      channel,
+      JSON.stringify({ type: "caption", meetingId, payload: interim }),
+    );
     await waitFor(() => received.length >= 1);
-    await publisher.publish(channel, JSON.stringify({ type: "caption", meetingId, payload: revisedInterim }));
+    await publisher.publish(
+      channel,
+      JSON.stringify({ type: "caption", meetingId, payload: revisedInterim }),
+    );
     await waitFor(() => received.length >= 2);
-    await publisher.publish(channel, JSON.stringify({ type: "caption", meetingId, payload: final }));
+    await publisher.publish(
+      channel,
+      JSON.stringify({ type: "caption", meetingId, payload: final }),
+    );
     await waitFor(() => received.length >= 3);
 
     expect(received).toEqual([
@@ -147,8 +166,18 @@ describe("live caption bridge (transcription-service -> realtime-gateway -> Sock
     const resolvedOrgA = randomUUID();
     const resolvedOrgB = randomUUID();
 
-    const socketA = await joinAs({ orgId: orgA, meetingId: sharedMeetingId, userId: `user-${randomUUID()}`, resolvedOrgId: resolvedOrgA });
-    const socketB = await joinAs({ orgId: orgB, meetingId: sharedMeetingId, userId: `user-${randomUUID()}`, resolvedOrgId: resolvedOrgB });
+    const socketA = await joinAs({
+      orgId: orgA,
+      meetingId: sharedMeetingId,
+      userId: `user-${randomUUID()}`,
+      resolvedOrgId: resolvedOrgA,
+    });
+    const socketB = await joinAs({
+      orgId: orgB,
+      meetingId: sharedMeetingId,
+      userId: `user-${randomUUID()}`,
+      resolvedOrgId: resolvedOrgB,
+    });
 
     const receivedA: CaptionMessage[] = [];
     const receivedB: CaptionMessage[] = [];
@@ -157,7 +186,11 @@ describe("live caption bridge (transcription-service -> realtime-gateway -> Sock
 
     await publisher.publish(
       pubsubChannel(resolvedOrgA, sharedMeetingId),
-      JSON.stringify({ type: "caption", meetingId: sharedMeetingId, payload: captionPayload({ text: "org A only", isFinal: true }) }),
+      JSON.stringify({
+        type: "caption",
+        meetingId: sharedMeetingId,
+        payload: captionPayload({ text: "org A only", isFinal: true }),
+      }),
     );
     await waitFor(() => receivedA.length >= 1);
     // Safety window: give a wrongly-implemented cross-tenant leak time to arrive at B before
@@ -170,7 +203,11 @@ describe("live caption bridge (transcription-service -> realtime-gateway -> Sock
     // And the reverse direction, on the SAME shared room, to rule out a one-directional bug.
     await publisher.publish(
       pubsubChannel(resolvedOrgB, sharedMeetingId),
-      JSON.stringify({ type: "caption", meetingId: sharedMeetingId, payload: captionPayload({ text: "org B only", isFinal: true }) }),
+      JSON.stringify({
+        type: "caption",
+        meetingId: sharedMeetingId,
+        payload: captionPayload({ text: "org B only", isFinal: true }),
+      }),
     );
     await waitFor(() => receivedB.length >= 1);
     await sleep(300);
@@ -191,7 +228,11 @@ describe("live caption bridge (transcription-service -> realtime-gateway -> Sock
 
     await publisher.publish(
       pubsubChannel(resolvedOrgId, meetingId),
-      JSON.stringify({ type: "caption", meetingId, payload: captionPayload({ text: "missed while disconnected", isFinal: true }) }),
+      JSON.stringify({
+        type: "caption",
+        meetingId,
+        payload: captionPayload({ text: "missed while disconnected", isFinal: true }),
+      }),
     );
     await sleep(150);
 

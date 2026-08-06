@@ -69,18 +69,26 @@ describe("caption channel unsubscribe survives a presence-removal failure on dis
     const meetingId = `meeting-${randomUUID()}`;
     const userId = `user-${randomUUID()}`;
     const resolvedOrgId = randomUUID();
-    coreApi.allowParticipant(orgId, meetingId, userId, { orgId: resolvedOrgId, userId: randomUUID() });
+    coreApi.allowParticipant(orgId, meetingId, userId, {
+      orgId: resolvedOrgId,
+      userId: randomUUID(),
+    });
 
     const token = await jwks.signToken({ orgId, userId });
     const socket = await connectClient(baseUrl, token);
-    const ack = await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId }, resolve));
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socket.emit("join", { meetingId }, resolve),
+    );
     expect(ack.ok).toBe(true);
 
     const channel = pubsubChannel(resolvedOrgId, meetingId);
 
     // Confirm the subscription actually exists on the real Redis server before breaking
     // anything — this is the same real, external signal we'll check again after disconnect.
-    await waitFor(async () => (await inspector.call("PUBSUB", "CHANNELS", channel)) as string[], (chans) => chans.includes(channel));
+    await waitFor(
+      async () => (await inspector.call("PUBSUB", "CHANNELS", channel)) as string[],
+      (chans) => chans.includes(channel),
+    );
 
     // Force the FIRST step of disconnect cleanup to fail, exactly as the reviewer's teardown
     // race did organically — but deterministically this time, via the real exported function
@@ -93,12 +101,18 @@ describe("caption channel unsubscribe survives a presence-removal failure on dis
 
     // The presence-removal failure must have actually been hit (otherwise this test would prove
     // nothing about the fix under test).
-    await waitFor(() => removeMemberSpy.mock.calls.length, (n) => n >= 1);
+    await waitFor(
+      () => removeMemberSpy.mock.calls.length,
+      (n) => n >= 1,
+    );
 
     // The real assertion: despite that failure, the channel is unsubscribed from Redis — proof
     // that `unsubscribeCaptionChannel` ran independently of the presence step, not skipped by
     // its failure.
-    await waitFor(async () => (await inspector.call("PUBSUB", "CHANNELS", channel)) as string[], (chans) => !chans.includes(channel));
+    await waitFor(
+      async () => (await inspector.call("PUBSUB", "CHANNELS", channel)) as string[],
+      (chans) => !chans.includes(channel),
+    );
   });
 });
 
@@ -106,13 +120,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitFor<T>(getValue: () => T | Promise<T>, predicate: (value: T) => boolean, timeoutMs = 3000): Promise<T> {
+async function waitFor<T>(
+  getValue: () => T | Promise<T>,
+  predicate: (value: T) => boolean,
+  timeoutMs = 3000,
+): Promise<T> {
   const start = Date.now();
   for (;;) {
     const value = await getValue();
     if (predicate(value)) return value;
     if (Date.now() - start > timeoutMs) {
-      throw new Error(`waitFor: condition not met within ${timeoutMs}ms (last value: ${JSON.stringify(value)})`);
+      throw new Error(
+        `waitFor: condition not met within ${timeoutMs}ms (last value: ${JSON.stringify(value)})`,
+      );
     }
     await sleep(20);
   }

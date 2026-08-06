@@ -39,7 +39,14 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
 const REDPANDA_BROKERS = process.env.REDPANDA_BROKERS ?? "localhost:9092";
 const SCHEMA_REGISTRY_URL = process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8081";
-const SERVER_ENTRY = path.join(REPO_ROOT, "dist", "services", "realtime-gateway", "src", "server.js");
+const SERVER_ENTRY = path.join(
+  REPO_ROOT,
+  "dist",
+  "services",
+  "realtime-gateway",
+  "src",
+  "server.js",
+);
 
 // Fast, test-only tuning (see server.ts's AppConfig doc comments for the production defaults).
 const HEARTBEAT_INTERVAL_MS = 150;
@@ -71,7 +78,10 @@ describe("presence survives an ungraceful pod death (real SIGKILL, two real proc
     redis = new Redis(REDIS_URL);
 
     const registry = new SchemaRegistry({ host: SCHEMA_REGISTRY_URL });
-    const kafka = new Kafka({ clientId: "presence-pod-death-test-consumer", brokers: [REDPANDA_BROKERS] });
+    const kafka = new Kafka({
+      clientId: "presence-pod-death-test-consumer",
+      brokers: [REDPANDA_BROKERS],
+    });
     consumer = kafka.consumer({ groupId: `test-presence-pod-death-${randomUUID()}` });
     await consumer.connect();
     await consumer.subscribe({ topic: "presence-events", fromBeginning: false });
@@ -119,65 +129,74 @@ describe("presence survives an ungraceful pod death (real SIGKILL, two real proc
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
-    child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[gateway:${port}] ${chunk}`));
+    child.stderr?.on("data", (chunk: Buffer) =>
+      process.stderr.write(`[gateway:${port}] ${chunk.toString()}`),
+    );
     return child;
   }
 
-  it(
-    "a member's presence entry is excluded from reads quickly and physically reaped, with a leave event produced, after its owning process is SIGKILL'd",
-    async () => {
-      const orgId = randomUUID();
-      const meetingId = randomUUID();
-      const userId = randomUUID();
-      // Already valid UUIDs (this test is about surviving a real SIGKILL, not identity
-      // resolution — that's covered in gateway.test.ts), so resolve identity-mapped.
-      coreApi.allowParticipant(orgId, meetingId, userId, { orgId, userId });
+  it("a member's presence entry is excluded from reads quickly and physically reaped, with a leave event produced, after its owning process is SIGKILL'd", async () => {
+    const orgId = randomUUID();
+    const meetingId = randomUUID();
+    const userId = randomUUID();
+    // Already valid UUIDs (this test is about surviving a real SIGKILL, not identity
+    // resolution — that's covered in gateway.test.ts), so resolve identity-mapped.
+    coreApi.allowParticipant(orgId, meetingId, userId, { orgId, userId });
 
-      const token = await jwks.signToken({ orgId, userId });
-      const socket = await connectClient(`http://127.0.0.1:${portA}`, token);
-      const ack = await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId }, resolve));
-      expect(ack).toEqual({ ok: true, presence: [userId] });
+    const token = await jwks.signToken({ orgId, userId });
+    const socket = await connectClient(`http://127.0.0.1:${portA}`, token);
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socket.emit("join", { meetingId }, resolve),
+    );
+    expect(ack).toEqual({ ok: true, presence: [userId] });
 
-      // sanity: the member is actually there with a fresh heartbeat before we kill anything
-      const key = presenceKey(orgId, meetingId);
-      const scoreBefore = await redis.zscore(key, userId);
-      expect(scoreBefore).not.toBeNull();
+    // sanity: the member is actually there with a fresh heartbeat before we kill anything
+    const key = presenceKey(orgId, meetingId);
+    const scoreBefore = await redis.zscore(key, userId);
+    expect(scoreBefore).not.toBeNull();
 
-      await waitFor(() =>
-        received.some((e) => e.meeting_id === meetingId && e.event_type === "join" && e.header.org_id === orgId),
-      );
+    await waitFor(() =>
+      received.some(
+        (e) => e.meeting_id === meetingId && e.event_type === "join" && e.header.org_id === orgId,
+      ),
+    );
 
-      // The socket is never closed and no disconnect ever fires anywhere: this is an ungraceful
-      // process death, not a client disconnect.
-      procA.kill("SIGKILL");
+    // The socket is never closed and no disconnect ever fires anywhere: this is an ungraceful
+    // process death, not a client disconnect.
+    procA.kill("SIGKILL");
 
-      // Layer 1: read-time freshness filtering excludes the ghost quickly, without waiting for a
-      // physical sweep. Poll listPresence's underlying query directly against Redis.
-      await waitFor(async () => {
-        const fresh = await redis.zrangebyscore(key, Date.now() - STALE_AFTER_MS, "+inf");
-        return !fresh.includes(userId);
-      }, STALE_AFTER_MS + 2000);
+    // Layer 1: read-time freshness filtering excludes the ghost quickly, without waiting for a
+    // physical sweep. Poll listPresence's underlying query directly against Redis.
+    await waitFor(async () => {
+      const fresh = await redis.zrangebyscore(key, Date.now() - STALE_AFTER_MS, "+inf");
+      return !fresh.includes(userId);
+    }, STALE_AFTER_MS + 2000);
 
-      // Layer 2: process B (still alive, never had a local socket for this meeting) physically
-      // reaps the member via its own sweep timer, and prunes the now-empty meeting from the index.
-      await waitFor(async () => (await redis.zscore(key, userId)) === null, SWEEP_INTERVAL_MS + STALE_AFTER_MS + 3000);
-      await waitFor(
-        async () => (await redis.sismember(presenceIndexKey(), `${orgId}|${meetingId}`)) === 0,
-        SWEEP_INTERVAL_MS + 3000,
-      );
+    // Layer 2: process B (still alive, never had a local socket for this meeting) physically
+    // reaps the member via its own sweep timer, and prunes the now-empty meeting from the index.
+    await waitFor(
+      async () => (await redis.zscore(key, userId)) === null,
+      SWEEP_INTERVAL_MS + STALE_AFTER_MS + 3000,
+    );
+    await waitFor(
+      async () => (await redis.sismember(presenceIndexKey(), `${orgId}|${meetingId}`)) === 0,
+      SWEEP_INTERVAL_MS + 3000,
+    );
 
-      // The sweep also produced a `leave` presence-event — the only process that could have
-      // produced it is B, since A died before it could run its own disconnect-driven produce.
-      await waitFor(
-        () =>
-          received.some(
-            (e) => e.meeting_id === meetingId && e.event_type === "leave" && e.user_id === userId && e.header.org_id === orgId,
-          ),
-        10000,
-      );
-    },
-    45000,
-  );
+    // The sweep also produced a `leave` presence-event — the only process that could have
+    // produced it is B, since A died before it could run its own disconnect-driven produce.
+    await waitFor(
+      () =>
+        received.some(
+          (e) =>
+            e.meeting_id === meetingId &&
+            e.event_type === "leave" &&
+            e.user_id === userId &&
+            e.header.org_id === orgId,
+        ),
+      10000,
+    );
+  }, 45000);
 });
 
 function findFreePort(): Promise<number> {
@@ -216,7 +235,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 5000): Promise<void> {
+async function waitFor(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 5000,
+): Promise<void> {
   const start = Date.now();
   while (!(await predicate())) {
     if (Date.now() - start > timeoutMs) {

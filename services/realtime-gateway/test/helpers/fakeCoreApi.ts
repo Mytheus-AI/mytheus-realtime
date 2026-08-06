@@ -72,7 +72,12 @@ export interface FakeCoreApi {
    * wire (org_id claim inside the JWT, Clerk user id in the path) — as an allowed participant.
    * `resolved` controls what the 200 response body contains; see this file's header comment.
    */
-  allowParticipant(orgId: string, meetingId: string, userId: string, resolved?: ResolvedIdentity): void;
+  allowParticipant(
+    orgId: string,
+    meetingId: string,
+    userId: string,
+    resolved?: ResolvedIdentity,
+  ): void;
   chatCalls: RecordedChatCall[];
   close(): Promise<void>;
 }
@@ -135,7 +140,11 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
         const idempotencyKey = (req.headers["idempotency-key"] as string | undefined) ?? null;
         if (!idempotencyKey || !seenIdempotencyKeys.has(idempotencyKey)) {
           if (idempotencyKey) seenIdempotencyKeys.add(idempotencyKey);
-          const parsed = JSON.parse(body || "{}") as { meeting_id: string; content: string; user_id?: string };
+          const parsed = JSON.parse(body || "{}") as {
+            meeting_id: string;
+            content: string;
+            user_id?: string;
+          };
           chatCalls.push({
             orgId: clerkOrgIdFromAuthHeader(req.headers.authorization),
             meetingId: parsed.meeting_id,
@@ -167,7 +176,9 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
     },
     chatCalls,
     async close() {
-      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) =>
+        server.close((err) => (err ? reject(err) : resolve())),
+      );
     },
   };
 }

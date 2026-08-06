@@ -36,7 +36,10 @@ describe("coreApiClient.isParticipant — response parsing contract", () => {
     const userId = `user-${randomUUID()}`;
     const resolvedOrgId = randomUUID();
     const resolvedUserId = randomUUID();
-    coreApi.allowParticipant(orgId, meetingId, userId, { orgId: resolvedOrgId, userId: resolvedUserId });
+    coreApi.allowParticipant(orgId, meetingId, userId, {
+      orgId: resolvedOrgId,
+      userId: resolvedUserId,
+    });
     // core-api resolves tenancy solely from the caller's own re-verified bearer token (no
     // X-Org-Id header — see coreApiClient.ts's header comment), so the fake needs a real JWT
     // carrying this test's orgId, not a placeholder string.
@@ -44,7 +47,11 @@ describe("coreApiClient.isParticipant — response parsing contract", () => {
 
     const result = await client.isParticipant({ orgId, meetingId, userId, bearerToken });
 
-    expect(result).toEqual({ allowed: true, internalUserId: resolvedUserId, internalOrgId: resolvedOrgId });
+    expect(result).toEqual({
+      allowed: true,
+      internalUserId: resolvedUserId,
+      internalOrgId: resolvedOrgId,
+    });
   });
 
   it("resolves { allowed: true, internalOrgId: null } when core-api's response has no org_id field (regression guard — core-api has shipped this field since mytheus-backend commit ca9a8db, but this parsing path stays covered)", async () => {

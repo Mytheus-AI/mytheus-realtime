@@ -29,7 +29,14 @@ import { startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
-const SERVER_ENTRY = path.join(REPO_ROOT, "dist", "services", "realtime-gateway", "src", "server.js");
+const SERVER_ENTRY = path.join(
+  REPO_ROOT,
+  "dist",
+  "services",
+  "realtime-gateway",
+  "src",
+  "server.js",
+);
 
 describe("cross-pod caption fan-out (two separate processes, one Redis pub/sub message each)", () => {
   let jwks: FakeJwksServer;
@@ -79,67 +86,67 @@ describe("cross-pod caption fan-out (two separate processes, one Redis pub/sub m
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      process.stderr.write(`[gateway:${port}] ${chunk}`);
+      process.stderr.write(`[gateway:${port}] ${chunk.toString()}`);
     });
     return child;
   }
 
-  it(
-    "delivers one caption, published once, to sockets on two independent gateway processes, exactly once each",
-    async () => {
-      const orgId = randomUUID();
-      const meetingId = randomUUID();
-      const userA = randomUUID();
-      const userB = randomUUID();
-      // Resolved == Clerk ids here on purpose (this test is about cross-pod delivery, not
-      // identity resolution — that's gateway.test.ts's job).
-      coreApi.allowParticipant(orgId, meetingId, userA, { orgId, userId: userA });
-      coreApi.allowParticipant(orgId, meetingId, userB, { orgId, userId: userB });
+  it("delivers one caption, published once, to sockets on two independent gateway processes, exactly once each", async () => {
+    const orgId = randomUUID();
+    const meetingId = randomUUID();
+    const userA = randomUUID();
+    const userB = randomUUID();
+    // Resolved == Clerk ids here on purpose (this test is about cross-pod delivery, not
+    // identity resolution — that's gateway.test.ts's job).
+    coreApi.allowParticipant(orgId, meetingId, userA, { orgId, userId: userA });
+    coreApi.allowParticipant(orgId, meetingId, userB, { orgId, userId: userB });
 
-      const tokenA = await jwks.signToken({ orgId, userId: userA });
-      const tokenB = await jwks.signToken({ orgId, userId: userB });
+    const tokenA = await jwks.signToken({ orgId, userId: userA });
+    const tokenB = await jwks.signToken({ orgId, userId: userB });
 
-      const socketA = await connectClient(`http://127.0.0.1:${portA}`, tokenA);
-      const socketB = await connectClient(`http://127.0.0.1:${portB}`, tokenB);
+    const socketA = await connectClient(`http://127.0.0.1:${portA}`, tokenA);
+    const socketB = await connectClient(`http://127.0.0.1:${portB}`, tokenB);
 
-      const ackA = await new Promise<JoinAck>((resolve) => socketA.emit("join", { meetingId }, resolve));
-      const ackB = await new Promise<JoinAck>((resolve) => socketB.emit("join", { meetingId }, resolve));
-      expect(ackA.ok).toBe(true);
-      expect(ackB.ok).toBe(true);
+    const ackA = await new Promise<JoinAck>((resolve) =>
+      socketA.emit("join", { meetingId }, resolve),
+    );
+    const ackB = await new Promise<JoinAck>((resolve) =>
+      socketB.emit("join", { meetingId }, resolve),
+    );
+    expect(ackA.ok).toBe(true);
+    expect(ackB.ok).toBe(true);
 
-      const receivedA: unknown[] = [];
-      const receivedB: unknown[] = [];
-      socketA.on("caption", (msg: unknown) => receivedA.push(msg));
-      socketB.on("caption", (msg: unknown) => receivedB.push(msg));
+    const receivedA: unknown[] = [];
+    const receivedB: unknown[] = [];
+    socketA.on("caption", (msg: unknown) => receivedA.push(msg));
+    socketB.on("caption", (msg: unknown) => receivedB.push(msg));
 
-      const payload = {
-        chunkId: randomUUID(),
-        speakerId: "0",
-        startMs: 0,
-        endMs: 1200,
-        text: "hello there, how are you",
-        isFinal: true,
-        confidence: 0.97,
-      };
-      await publisher.publish(
-        pubsubChannel(orgId, meetingId),
-        JSON.stringify({ type: "caption", meetingId, payload }),
-      );
+    const payload = {
+      chunkId: randomUUID(),
+      speakerId: "0",
+      startMs: 0,
+      endMs: 1200,
+      text: "hello there, how are you",
+      isFinal: true,
+      confidence: 0.97,
+    };
+    await publisher.publish(
+      pubsubChannel(orgId, meetingId),
+      JSON.stringify({ type: "caption", meetingId, payload }),
+    );
 
-      await waitFor(() => receivedA.length >= 1 && receivedB.length >= 1);
-      // Settle window: prove it's exactly once, not "at least once" — a bug routing this
-      // through the Redis adapter's own cross-pod broadcast on top of the raw pub/sub delivery
-      // would double it.
-      await sleep(300);
+    await waitFor(() => receivedA.length >= 1 && receivedB.length >= 1);
+    // Settle window: prove it's exactly once, not "at least once" — a bug routing this
+    // through the Redis adapter's own cross-pod broadcast on top of the raw pub/sub delivery
+    // would double it.
+    await sleep(300);
 
-      expect(receivedA).toEqual([{ meetingId, payload }]);
-      expect(receivedB).toEqual([{ meetingId, payload }]);
+    expect(receivedA).toEqual([{ meetingId, payload }]);
+    expect(receivedB).toEqual([{ meetingId, payload }]);
 
-      socketA.close();
-      socketB.close();
-    },
-    20000,
-  );
+    socketA.close();
+    socketB.close();
+  }, 20000);
 });
 
 function sleep(ms: number): Promise<void> {

@@ -43,7 +43,10 @@ describe("presence-events production against the real broker", () => {
     coreApi = await startFakeCoreApi();
 
     const registry = new SchemaRegistry({ host: SCHEMA_REGISTRY_URL });
-    const kafka = new Kafka({ clientId: "presence-events-test-consumer", brokers: REDPANDA_BROKERS });
+    const kafka = new Kafka({
+      clientId: "presence-events-test-consumer",
+      brokers: REDPANDA_BROKERS,
+    });
     consumer = kafka.consumer({ groupId: `test-presence-events-${randomUUID()}` });
     await consumer.connect();
     await consumer.subscribe({ topic: "presence-events", fromBeginning: false });
@@ -88,47 +91,47 @@ describe("presence-events production against the real broker", () => {
     await coreApi.close();
   }, 30000);
 
-  it(
-    "produces one join record on join and one leave record on disconnect, both partitioned by org_id",
-    async () => {
-      const orgId = randomUUID();
-      const meetingId = randomUUID();
-      const userId = randomUUID();
-      // Already valid UUIDs here (this test is about the Kafka contract, not about proving the
-      // identity-resolution fallback — that's covered in gateway.test.ts and coreApiClient's own
-      // tests), so resolve identity-mapped: what core-api "resolves" to is the same value.
-      coreApi.allowParticipant(orgId, meetingId, userId, { orgId, userId });
+  it("produces one join record on join and one leave record on disconnect, both partitioned by org_id", async () => {
+    const orgId = randomUUID();
+    const meetingId = randomUUID();
+    const userId = randomUUID();
+    // Already valid UUIDs here (this test is about the Kafka contract, not about proving the
+    // identity-resolution fallback — that's covered in gateway.test.ts and coreApiClient's own
+    // tests), so resolve identity-mapped: what core-api "resolves" to is the same value.
+    coreApi.allowParticipant(orgId, meetingId, userId, { orgId, userId });
 
-      const token = await jwks.signToken({ orgId, userId });
-      const socket = await connectClient(baseUrl, token);
-      await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId }, resolve));
+    const token = await jwks.signToken({ orgId, userId });
+    const socket = await connectClient(baseUrl, token);
+    await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId }, resolve));
 
-      await waitFor(() =>
-        received.some((r) => r.event.meeting_id === meetingId && r.event.event_type === "join"),
-      );
-      const joinRecord = received.find((r) => r.event.meeting_id === meetingId && r.event.event_type === "join");
-      expect(joinRecord).toBeDefined();
-      expect(joinRecord!.event.header.org_id).toBe(orgId);
-      expect(joinRecord!.event.user_id).toBe(userId);
-      expect(joinRecord!.event.header.producer).toBe("realtime-gateway");
-      expect(joinRecord!.partitionKey).toBe(orgId); // partitioned by org_id
+    await waitFor(() =>
+      received.some((r) => r.event.meeting_id === meetingId && r.event.event_type === "join"),
+    );
+    const joinRecord = received.find(
+      (r) => r.event.meeting_id === meetingId && r.event.event_type === "join",
+    );
+    expect(joinRecord).toBeDefined();
+    expect(joinRecord!.event.header.org_id).toBe(orgId);
+    expect(joinRecord!.event.user_id).toBe(userId);
+    expect(joinRecord!.event.header.producer).toBe("realtime-gateway");
+    expect(joinRecord!.partitionKey).toBe(orgId); // partitioned by org_id
 
-      socket.close();
+    socket.close();
 
-      await waitFor(() =>
-        received.some((r) => r.event.meeting_id === meetingId && r.event.event_type === "leave"),
-      );
-      const leaveRecord = received.find((r) => r.event.meeting_id === meetingId && r.event.event_type === "leave");
-      expect(leaveRecord).toBeDefined();
-      expect(leaveRecord!.event.header.org_id).toBe(orgId);
-      expect(leaveRecord!.event.user_id).toBe(userId);
-      expect(leaveRecord!.partitionKey).toBe(orgId);
+    await waitFor(() =>
+      received.some((r) => r.event.meeting_id === meetingId && r.event.event_type === "leave"),
+    );
+    const leaveRecord = received.find(
+      (r) => r.event.meeting_id === meetingId && r.event.event_type === "leave",
+    );
+    expect(leaveRecord).toBeDefined();
+    expect(leaveRecord!.event.header.org_id).toBe(orgId);
+    expect(leaveRecord!.event.user_id).toBe(userId);
+    expect(leaveRecord!.partitionKey).toBe(orgId);
 
-      // exactly one record per transition, not more
-      expect(received.filter((r) => r.event.meeting_id === meetingId)).toHaveLength(2);
-    },
-    20000,
-  );
+    // exactly one record per transition, not more
+    expect(received.filter((r) => r.event.meeting_id === meetingId)).toHaveLength(2);
+  }, 20000);
 });
 
 function sleep(ms: number): Promise<void> {

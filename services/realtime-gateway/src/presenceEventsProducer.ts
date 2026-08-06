@@ -72,7 +72,10 @@ export interface PresenceEventsProducer {
 export interface MinimalKafkaProducer {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
-  send(record: { topic: string; messages: Array<{ key?: string; value: Buffer | string }> }): Promise<unknown>;
+  send(record: {
+    topic: string;
+    messages: Array<{ key?: string; value: Buffer | string }>;
+  }): Promise<unknown>;
 }
 
 /** The subset of `@kafkajs/confluent-schema-registry`'s `SchemaRegistry` this module calls. */
@@ -91,7 +94,10 @@ export interface PresenceEventsProducerOptions {
   /** Injectable for tests; production always builds a real `SchemaRegistry` from
    * `schemaRegistryUrl`. */
   registry?: MinimalSchemaRegistry;
-  logger?: { error: (obj: unknown, msg?: string) => void; warn?: (obj: unknown, msg?: string) => void };
+  logger?: {
+    error: (obj: unknown, msg?: string) => void;
+    warn?: (obj: unknown, msg?: string) => void;
+  };
 }
 
 /** RFC 4122-shaped, version-agnostic (accepts anything Postgres/`crypto.randomUUID()` would
@@ -120,8 +126,13 @@ const PRODUCER_NAME = "realtime-gateway";
  */
 const PRODUCE_RETRIES = 5;
 
-export function createPresenceEventsProducer(options: PresenceEventsProducerOptions): PresenceEventsProducer {
-  const kafka = new Kafka({ clientId: options.clientId ?? "realtime-gateway", brokers: options.brokers });
+export function createPresenceEventsProducer(
+  options: PresenceEventsProducerOptions,
+): PresenceEventsProducer {
+  const kafka = new Kafka({
+    clientId: options.clientId ?? "realtime-gateway",
+    brokers: options.brokers,
+  });
   const producer: MinimalKafkaProducer =
     options.producer ??
     kafka.producer({
@@ -129,12 +140,18 @@ export function createPresenceEventsProducer(options: PresenceEventsProducerOpti
       createPartitioner: Partitioners.DefaultPartitioner,
       retry: { retries: PRODUCE_RETRIES },
     });
-  const registry: MinimalSchemaRegistry = options.registry ?? new SchemaRegistry({ host: options.schemaRegistryUrl });
+  const registry: MinimalSchemaRegistry =
+    options.registry ?? new SchemaRegistry({ host: options.schemaRegistryUrl });
 
   let schemaId: number | undefined;
   let connected = false;
 
-  async function routeToDlq(orgId: string, idempotencyKey: string, rawValueJson: unknown, err: unknown): Promise<void> {
+  async function routeToDlq(
+    orgId: string,
+    idempotencyKey: string,
+    rawValueJson: unknown,
+    err: unknown,
+  ): Promise<void> {
     const dlqEnvelope = buildDlqEnvelope({
       originalTopic: TOPIC,
       orgId,

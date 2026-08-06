@@ -35,80 +35,81 @@ describe("caption bridge latency — the gateway's own leg only", () => {
     await t.stop();
   });
 
-  it(
-    `reports p50/p95/p99 over ${SAMPLES} publish-to-client-receive samples on loopback`,
-    async () => {
-      const orgId = `org-${randomUUID()}`;
-      const meetingId = `meeting-${randomUUID()}`;
-      const userId = `user-${randomUUID()}`;
-      const resolvedOrgId = randomUUID();
-      t.coreApi.allowParticipant(orgId, meetingId, userId, { orgId: resolvedOrgId, userId: randomUUID() });
+  it(`reports p50/p95/p99 over ${SAMPLES} publish-to-client-receive samples on loopback`, async () => {
+    const orgId = `org-${randomUUID()}`;
+    const meetingId = `meeting-${randomUUID()}`;
+    const userId = `user-${randomUUID()}`;
+    const resolvedOrgId = randomUUID();
+    t.coreApi.allowParticipant(orgId, meetingId, userId, {
+      orgId: resolvedOrgId,
+      userId: randomUUID(),
+    });
 
-      const token = await t.jwks.signToken({ orgId, userId });
-      const socket = await connectClient(t.baseUrl, token);
-      const ack = await new Promise<JoinAck>((resolve) => socket.emit("join", { meetingId }, resolve));
-      expect(ack.ok).toBe(true);
+    const token = await t.jwks.signToken({ orgId, userId });
+    const socket = await connectClient(t.baseUrl, token);
+    const ack = await new Promise<JoinAck>((resolve) =>
+      socket.emit("join", { meetingId }, resolve),
+    );
+    expect(ack.ok).toBe(true);
 
-      const channel = pubsubChannel(resolvedOrgId, meetingId);
-      const samples: number[] = [];
+    const channel = pubsubChannel(resolvedOrgId, meetingId);
+    const samples: number[] = [];
 
-      for (let i = 0; i < SAMPLES; i++) {
-        const chunkId = randomUUID();
-        const sentAt = process.hrtime.bigint();
-        const received = new Promise<void>((resolve) => {
-          const handler = (msg: { payload: { chunkId: string } }) => {
-            if (msg.payload.chunkId === chunkId) {
-              socket.off("caption", handler);
-              resolve();
-            }
-          };
-          socket.on("caption", handler);
-        });
+    for (let i = 0; i < SAMPLES; i++) {
+      const chunkId = randomUUID();
+      const sentAt = process.hrtime.bigint();
+      const received = new Promise<void>((resolve) => {
+        const handler = (msg: { payload: { chunkId: string } }) => {
+          if (msg.payload.chunkId === chunkId) {
+            socket.off("caption", handler);
+            resolve();
+          }
+        };
+        socket.on("caption", handler);
+      });
 
-        await publisher.publish(
-          channel,
-          JSON.stringify({
-            type: "caption",
-            meetingId,
-            payload: {
-              chunkId,
-              speakerId: "0",
-              startMs: i * 400,
-              endMs: i * 400 + 400,
-              text: `sample ${i}`,
-              isFinal: true,
-              confidence: 0.9,
-            },
-          }),
-        );
-
-        await received;
-        const elapsedMs = Number(process.hrtime.bigint() - sentAt) / 1_000_000;
-        samples.push(elapsedMs);
-      }
-
-      samples.sort((a, b) => a - b);
-      const p50 = percentile(samples, 50);
-      const p95 = percentile(samples, 95);
-      const p99 = percentile(samples, 99);
-      const max = samples[samples.length - 1];
-
-      // eslint-disable-next-line no-console
-      console.log(
-        `[caption-latency] gateway-only leg (publish -> client receive, loopback, n=${SAMPLES}): ` +
-          `p50=${p50.toFixed(2)}ms p95=${p95.toFixed(2)}ms p99=${p99.toFixed(2)}ms max=${max.toFixed(2)}ms`,
+      await publisher.publish(
+        channel,
+        JSON.stringify({
+          type: "caption",
+          meetingId,
+          payload: {
+            chunkId,
+            speakerId: "0",
+            startMs: i * 400,
+            endMs: i * 400 + 400,
+            text: `sample ${i}`,
+            isFinal: true,
+            confidence: 0.9,
+          },
+        }),
       );
 
-      // A generous sanity ceiling for THIS leg only (loopback Redis pub/sub + Socket.io
-      // delivery), not a claim about the end-to-end Deepgram-bound budget in the brief (2s),
-      // which this test cannot measure and does not attempt to. This just catches a gross
-      // regression (e.g. an accidental synchronous block in the message handler).
-      expect(p95).toBeLessThan(250);
+      await received;
+      const elapsedMs = Number(process.hrtime.bigint() - sentAt) / 1_000_000;
+      samples.push(elapsedMs);
+    }
 
-      socket.close();
-    },
-    30000,
-  );
+    samples.sort((a, b) => a - b);
+    const p50 = percentile(samples, 50);
+    const p95 = percentile(samples, 95);
+    const p99 = percentile(samples, 99);
+    const max = samples[samples.length - 1];
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[caption-latency] gateway-only leg (publish -> client receive, loopback, n=${SAMPLES}): ` +
+        `p50=${p50.toFixed(2)}ms p95=${p95.toFixed(2)}ms p99=${p99.toFixed(2)}ms max=${max.toFixed(2)}ms`,
+    );
+
+    // A generous sanity ceiling for THIS leg only (loopback Redis pub/sub + Socket.io
+    // delivery), not a claim about the end-to-end Deepgram-bound budget in the brief (2s),
+    // which this test cannot measure and does not attempt to. This just catches a gross
+    // regression (e.g. an accidental synchronous block in the message handler).
+    expect(p95).toBeLessThan(250);
+
+    socket.close();
+  }, 30000);
 });
 
 function percentile(sortedAsc: number[], p: number): number {

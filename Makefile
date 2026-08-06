@@ -10,6 +10,7 @@ install:
 	cd $(TX) && uv sync
 
 lint:
+	cd $(GW) && npm run lint
 	cd $(TX) && uv run ruff check . && uv run black --check .
 
 typecheck:

@@ -102,7 +102,12 @@ describe("presenceEventsProducer DLQ routing", () => {
     await producer.connect();
 
     await expect(
-      producer.produce({ orgId: randomUUID(), meetingId: "meeting-1", userId: randomUUID(), eventType: "join" }),
+      producer.produce({
+        orgId: randomUUID(),
+        meetingId: "meeting-1",
+        userId: randomUUID(),
+        eventType: "join",
+      }),
     ).rejects.toThrow(/simulated broker failure/); // the ORIGINAL error, not the DLQ error
 
     expect(errors.length).toBeGreaterThan(0);
@@ -126,9 +131,19 @@ describe("presenceEventsProducer DLQ routing", () => {
     await producer.connect();
 
     // a raw Clerk org id — exactly the shape that caused the original bug
-    await producer.produce({ orgId: "org_2abcNotAUuid", meetingId: "meeting-1", userId: randomUUID(), eventType: "join" });
+    await producer.produce({
+      orgId: "org_2abcNotAUuid",
+      meetingId: "meeting-1",
+      userId: randomUUID(),
+      eventType: "join",
+    });
     // a raw Clerk user id (the JWT `sub`)
-    await producer.produce({ orgId: randomUUID(), meetingId: "meeting-1", userId: "user_alsoNotAUuid", eventType: "join" });
+    await producer.produce({
+      orgId: randomUUID(),
+      meetingId: "meeting-1",
+      userId: "user_alsoNotAUuid",
+      eventType: "join",
+    });
 
     expect(fakeProducer.sends).toHaveLength(0);
     expect(warnings.length).toBe(2);
