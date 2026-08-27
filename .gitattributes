@@ -1,0 +1,12 @@
+# Normalize line endings to LF in the repository AND in the working tree, on every platform.
+#
+# Without this, a checkout on Windows with the common global `core.autocrlf=true` rewrites every
+# file to CRLF. The committed blobs are already LF, so CI on Linux was green while `make lint`
+# failed on a Windows machine for all 30 files at once -- `prettier --check` defaults to
+# `endOfLine: "lf"` and sees every line as changed. The failure looked like a repo-wide style
+# violation and was purely a checkout artifact.
+#
+# `eol=lf` (not just `text=auto`) is the load-bearing part: `text=auto` alone still honours
+# `core.autocrlf` for the working tree, which is exactly the setting that caused this.
+# `text=auto` keeps git's binary detection, so images and other binaries are left untouched.
+* text=auto eol=lf
