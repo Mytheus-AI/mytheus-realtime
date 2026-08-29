@@ -23,7 +23,11 @@ from .audit import record_session_decision
 from .db import set_current_org
 from .persistence import process_utterance
 from .providers.base import TranscriptionProvider, TranscriptionStream
-from .tenancy import get_data_residency_region, get_pii_redaction_enabled
+from .tenancy import (
+    get_data_residency_region,
+    get_ner_unavailable_policy,
+    get_pii_redaction_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,12 @@ class SessionTracker:
                 await set_current_org(session, org_id)
                 region = await get_data_residency_region(session, org_id)
                 pii_redaction_enabled = await get_pii_redaction_enabled(session, org_id)
+                # Read once at stream open, alongside the other two tenant facts, rather than
+                # per utterance: it is a compliance posture, not a live toggle, and a
+                # per-final read would put a query on the p95 < 2 s caption path for a value
+                # that changes about never. A tenant who flips it mid-meeting gets the new
+                # policy on their next meeting, same as `pii_redaction_enabled` above.
+                ner_unavailable_policy = await get_ner_unavailable_policy(session, org_id)
                 # Compliance gate acceptance check: "an audit-log entry records the
                 # redaction-toggle and any cross-border decision" — same transaction as the
                 # reads above, so the audit entry and the decision it records can never drift.
@@ -81,6 +91,7 @@ class SessionTracker:
                 org_id=org_id,
                 meeting_id=meeting_id,
                 pii_redaction_enabled=pii_redaction_enabled,
+                ner_unavailable_policy=ner_unavailable_policy,
             )
         )
         self._sessions[meeting_id] = _MeetingSession(
@@ -110,6 +121,7 @@ class SessionTracker:
         org_id: str,
         meeting_id: str,
         pii_redaction_enabled: bool,
+        ner_unavailable_policy: str,
     ) -> None:
         """Drains `stream.utterances()` into `persistence.process_utterance` for the life of
         the stream. Errors are logged, never allowed to crash the event loop silently -- a
@@ -123,6 +135,7 @@ class SessionTracker:
                     meeting_id=meeting_id,
                     utterance=utterance,
                     pii_redaction_enabled=pii_redaction_enabled,
+                    ner_unavailable_policy=ner_unavailable_policy,
                 )
         except asyncio.CancelledError:
             raise

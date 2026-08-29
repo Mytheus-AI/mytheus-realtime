@@ -19,6 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # toward the SAFER behavior: redact by default, and pin to `us` rather than guess a region).
 _DEFAULT_PII_REDACTION_ENABLED = True
 _DEFAULT_REGION = "us"
+# ADR-0020 § The unavailable-NER decision, carried as `tenant_settings.ner_unavailable_policy`
+# by ADR-0024. `regex_only` matches the column's own DEFAULT, so a tenant with no row and a
+# tenant who never touched the setting behave identically. It is also the safer default in the
+# sense that matters for a MISSING row: `drop` would silently discard a tenant's entire
+# transcript whenever this read fell through, which is a data-loss failure mode dressed as a
+# privacy one. Structured PII is still removed on this path regardless.
+_DEFAULT_NER_UNAVAILABLE_POLICY = "regex_only"
 
 
 async def get_pii_redaction_enabled(session: AsyncSession, org_id: str) -> bool:
@@ -41,4 +48,22 @@ async def get_data_residency_region(session: AsyncSession, org_id: str) -> str:
     ).first()
     if row is None:
         return _DEFAULT_REGION
+    return str(row[0])
+
+
+async def get_ner_unavailable_policy(session: AsyncSession, org_id: str) -> str:
+    """What to do with a final when `ner-service` is unreachable and redaction is on.
+
+    `drop` loses the record; `regex_only` persists it with the deterministic layer applied and
+    `transcript_chunks.partially_redacted` set. Persisting raw is not representable, having
+    been rejected outright by ADR-0020.
+    """
+    row = (
+        await session.execute(
+            text("SELECT ner_unavailable_policy FROM tenant_settings WHERE org_id = :org_id"),
+            {"org_id": org_id},
+        )
+    ).first()
+    if row is None or not row[0]:
+        return _DEFAULT_NER_UNAVAILABLE_POLICY
     return str(row[0])

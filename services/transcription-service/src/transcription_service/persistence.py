@@ -14,6 +14,7 @@ construction, not by a comment.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from redis.asyncio import Redis
@@ -24,8 +25,10 @@ from .captions import publish_caption
 from .db import tenant_transaction
 from .events import TranscriptChunk, build_envelope_header
 from .outbox import enqueue
+from .pii_pipeline import POLICY_REGEX_ONLY, redact_final_with_policy
 from .providers.base import Utterance
-from .redaction import redact
+
+logger = logging.getLogger(__name__)
 
 PRODUCER_NAME = "transcription-service"
 TOPIC = "transcript-chunks"
@@ -58,6 +61,7 @@ async def _write_final(
     utterance: Utterance,
     text_value: str,
     redacted: bool,
+    partially_redacted: bool = False,
 ) -> FinalWriteResult | None:
     idempotency_key = _idempotency_key(utterance.chunk_id)
     header = build_envelope_header(
@@ -73,6 +77,12 @@ async def _write_final(
         text=text_value,
         is_final=True,
         confidence=utterance.confidence,
+        # `partially_redacted` is deliberately NOT on the envelope. ADR-0020's option 2 asks
+        # that "the row records that it was only partially redacted" - an at-rest fact for the
+        # tenant's own audit, not a consumer contract. Adding a field to `TranscriptChunk`
+        # would be a `mytheus-events` schema change with a BACKWARD-compatibility gate and a
+        # client-package bump in three repos, for a flag no consumer has asked for. When one
+        # does, it lands there first, canon-first, rather than being smuggled in from here.
         redacted=redacted,
     )
 
@@ -97,9 +107,9 @@ async def _write_final(
         text(
             "INSERT INTO transcript_chunks "
             "(id, org_id, meeting_id, speaker_id, start_ms, end_ms, text, is_final, "
-            "confidence, redacted) "
+            "confidence, redacted, partially_redacted) "
             "VALUES (:id, :org_id, :meeting_id, :speaker_id, :start_ms, :end_ms, :text, "
-            "true, :confidence, :redacted)"
+            "true, :confidence, :redacted, :partially_redacted)"
         ),
         {
             "id": utterance.chunk_id,
@@ -111,6 +121,7 @@ async def _write_final(
             "text": text_value,
             "confidence": utterance.confidence,
             "redacted": redacted,
+            "partially_redacted": partially_redacted,
         },
     )
     return FinalWriteResult(
@@ -126,6 +137,7 @@ async def process_utterance(
     meeting_id: str,
     utterance: Utterance,
     pii_redaction_enabled: bool,
+    ner_unavailable_policy: str = POLICY_REGEX_ONLY,
 ) -> FinalWriteResult | None:
     """The one call site. Returns `None` for every interim (by construction — the `if not
     is_final` branch never touches `session_factory` or the outbox at all) and for a
@@ -165,9 +177,29 @@ async def process_utterance(
             await publish_caption(redis, org_id=org_id, meeting_id=meeting_id, utterance=utterance)
         return None
 
-    text_value, redacted = (
-        redact(utterance.text) if pii_redaction_enabled else (utterance.text, False)
-    )
+    if pii_redaction_enabled:
+        # The full pass: deterministic layer, then `ner-service`, then the reversible token
+        # vault, each degrading independently. See pii_pipeline.py for the four outcomes and
+        # why none of them is ever weaker than the irreversible redaction that shipped before.
+        outcome = await redact_final_with_policy(org_id, utterance.text, ner_unavailable_policy)
+        if outcome.text is None:
+            # The tenant's `ner_unavailable_policy` is `drop`: they would rather lose the
+            # record than persist one whose unstructured entities were never inspected. No
+            # transcript_chunks row, no outbox row, and no caption either - publishing the
+            # caption for a final we refused to persist would leak the text the policy exists
+            # to keep out, on the one path that has no `redacted` flag to qualify it.
+            logger.info(
+                "final dropped by ner_unavailable_policy",
+                extra={"org_id": org_id, "meeting_id": meeting_id},
+            )
+            return None
+        text_value, redacted, partially_redacted = (
+            outcome.text,
+            outcome.redacted,
+            outcome.partially_redacted,
+        )
+    else:
+        text_value, redacted, partially_redacted = utterance.text, False, False
 
     async with tenant_transaction(session_factory, org_id) as session:
         result = await _write_final(
@@ -177,6 +209,7 @@ async def process_utterance(
             utterance=utterance,
             text_value=text_value,
             redacted=redacted,
+            partially_redacted=partially_redacted,
         )
 
     if result is not None and redis is not None:
