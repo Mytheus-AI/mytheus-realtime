@@ -59,25 +59,73 @@ mytheus-realtime/
 
 **Run**
 
+This repo has no compose file of its own: local Postgres (host port 5433), Redis (6380),
+Redpanda (9092) and Schema Registry (8081) come from `mytheus-backend`'s `docker compose`.
+
 ```bash
-# 1. Bring up local infra (Redis + Redpanda + Schema Registry)
-docker compose up -d
+# 1. Local infra, from the mytheus-backend checkout (Postgres 5433, Redis 6380, Redpanda 9092)
+(cd ../mytheus-backend && docker compose up -d)
 
-# 2. realtime-gateway (Node)
+# 2. Shared libs + realtime-gateway (Node) on port 8090
+cd libs && npm install && cd ..
 cd services/realtime-gateway
+cp .env.example .env            # PORT=8090, CORE_API_URL=http://localhost:8002 (core-api)
 npm install
-npm run dev
+npm run build && npm start      # http://localhost:8090
+cd ../..
 
-# 3. transcription-service (Python)
+# 3. transcription-service (Python, uv) on port 8091
 cd services/transcription-service
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-uvicorn app.main:app --reload --port 8081
+cp .env.example .env            # set INTERNAL_AUDIO_TOKEN and TRANSCRIPTION_ALLOW_FAKE_PROVIDER=1
+uv sync
+uv run alembic upgrade head     # transcript_chunks + its grant (after mytheus-backend's migrations)
+uv run uvicorn transcription_service.main:app --reload --port 8091
+# liveness:  curl localhost:8091/healthz
+# readiness: curl localhost:8091/readyz   (db / redis / broker)
 
-# 4. Smoke test
-npm test                       # gateway
-pytest                         # transcription-service
+# 4. Checks (or `make ci` from the repo root)
+make lint typecheck test
 ```
+
+## transcription-service `/internal/audio` contract
+
+The server-side audio hook (`meeting-service`'s audio tap) connects to
+`ws://<transcription-service>:8091/internal/audio`. The authoritative definition is the module
+docstring of `services/transcription-service/src/transcription_service/audio_in.py`; this is
+its summary.
+
+1. One connection PER PARTICIPANT AUDIO TRACK; a meeting has several concurrent connections.
+   No query parameters.
+2. Handshake header `X-Internal-Auth: <INTERNAL_AUDIO_TOKEN>` (constant-time compare). Missing,
+   wrong, or the server's `INTERNAL_AUDIO_TOKEN` unset: the upgrade is refused (HTTP 403).
+3. First frame: a text frame with one JSON object, all keys required:
+   `{"org_id": "<uuid>", "meeting_id": "<uuid>", "participant_identity": "<users.id>",
+   "sample_rate": 16000, "encoding": "pcm_s16le"}`. Must arrive within 10 s. Resent on every
+   reconnect.
+4. Then binary frames of raw PCM, 16 kHz mono s16le, even length, at most 65536 bytes each
+   (about 10 ms per frame from the sender).
+5. Later text frames are JSON control only, never audio: `{"type": "stop"}` flushes queued
+   audio and closes 1000; anything else is ignored.
+6. Each connection gets its own provider stream (`diarize=false`). Everything it produces is
+   attributed to its `participant_identity`, persisted as `transcript_chunks.speaker_id` (and
+   the `transcript-chunks` `speaker_id`, and the caption `speakerId`), which the existing
+   `meeting_speakers` mapping resolves. No schema change.
+7. Supersede key is `(org_id, meeting_id, participant_identity)`: a reconnect by the same
+   participant closes only that participant's old connection (4409). Other participants keep
+   streaming. The meeting session (org check, region/redaction settings, audit entry, captions
+   room) closes when its last participant connection ends.
+
+Close codes: 1000 normal (stop / stream ended), 1001 server shutting down (reconnect),
+1007 odd-length frame, 1009 frame too large, 1011 internal error or no provider configured
+(reconnect with backoff), 4400 bad init frame, 4403 meeting not in org, 4408 init or idle
+timeout (30 s), 4409 superseded by the same participant's newer connection, 4451 compliance
+gate closed (audio dropped, nothing emitted, do not reconnect).
+
+While the compliance gate is closed (`COMPLIANCE_GATE_GREEN = False`), any connection served
+by a real (non-fake) provider is closed 4451 right after the init frame, before any database
+access or provider contact. With no `DEEPGRAM_API_KEY`, the fake provider is used only when
+`TRANSCRIPTION_ALLOW_FAKE_PROVIDER=1` is set explicitly (local development); otherwise the
+service fails closed and refuses every connection with 1011.
 
 ## Environment variables
 
@@ -90,7 +138,14 @@ pytest                         # transcription-service
 | `REDPANDA_BROKERS` | both | Kafka-API bootstrap brokers |
 | `SCHEMA_REGISTRY_URL` | both | Avro Schema Registry for `transcript-chunks` / `presence-events` |
 | `WS_BIND_HOST` / `WS_BIND_PORT` | realtime-gateway | WebSocket listener bind config |
-| `TRANSCRIPTION_WS_BIND` | transcription-service | Internal WS bind for the LiveKit audio hook |
+| `TRANSCRIPTION_WS_BIND` | transcription-service | Internal WS bind for the LiveKit audio hook (default `0.0.0.0:8091`) |
+| `INTERNAL_AUDIO_TOKEN` | transcription-service | Shared secret the audio sender presents in `X-Internal-Auth`; unset refuses every connection |
+| `AUDIO_INIT_TIMEOUT_SECONDS` / `AUDIO_IDLE_TIMEOUT_SECONDS` | transcription-service | `/internal/audio` init (10 s) and idle (30 s) timeouts |
+| `AUDIO_MAX_FRAME_BYTES` / `AUDIO_QUEUE_MAX_FRAMES` | transcription-service | Max PCM frame size (65536) and backpressure queue depth (100 frames) |
+| `TRANSCRIPTION_ALLOW_FAKE_PROVIDER` | transcription-service | `1` lets the fake provider run when no Deepgram key is set (local dev only); default off = fail closed |
+| `DATABASE_URL` | transcription-service | Shared Postgres (`transcript_chunks`, `outbox`, tenant reads) |
+| `PORT` | realtime-gateway | Gateway listen port (default `8090`) |
+| `CORE_API_URL` | realtime-gateway | `core-api` base URL (dev: `http://localhost:8002`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | both | OpenTelemetry traces/metrics export |
 
 ## Testing
