@@ -18,6 +18,7 @@ change; nothing else in this repo imports Deepgram.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -25,10 +26,23 @@ from dataclasses import dataclass
 from urllib.parse import urlencode
 
 import websockets
+from websockets.exceptions import ConnectionClosedError
 
 from ..compliance import assert_compliance_gate_green
 from ..residency import deepgram_endpoint_for_region
-from .base import TranscriptionProvider, TranscriptionStream, Utterance
+from .base import (
+    DEFAULT_ENCODING,
+    DEFAULT_SAMPLE_RATE,
+    ProviderStreamDropped,
+    TranscriptionProvider,
+    TranscriptionStream,
+    Utterance,
+)
+
+# Deepgram's documented end-of-stream control message: flushes any pending final and then
+# closes the socket cleanly (1000), which ends `utterances()` without a drop.
+_CLOSE_STREAM_MESSAGE = json.dumps({"type": "CloseStream"})
+_CLOSE_FLUSH_TIMEOUT_SECONDS = 1.5
 
 
 @dataclass
@@ -38,12 +52,34 @@ class _DeepgramStream:
     )
 
     async def utterances(self) -> AsyncIterator[Utterance]:
+        # An abnormal close (`ConnectionClosedError`: network loss, Deepgram's 1011 on an
+        # internal error or the NET-0001 no-audio timeout) is surfaced as the retryable
+        # `ProviderStreamDropped`; a clean close (`ConnectionClosedOK`, e.g. after our own
+        # CloseStream) just ends iteration. See `providers/base.py`.
+        try:
+            async for utterance in self._parse():
+                yield utterance
+        except ConnectionClosedError as exc:
+            raise ProviderStreamDropped("deepgram stream closed abnormally") from exc
+
+    async def send_audio(self, frame: bytes) -> None:
+        try:
+            await self._ws.send(frame)  # type: ignore[attr-defined]
+        except ConnectionClosedError as exc:
+            raise ProviderStreamDropped("deepgram stream closed abnormally") from exc
+
+    async def _parse(self) -> AsyncIterator[Utterance]:
         # Deepgram's streaming response shape: {"is_final": bool, "channel": {"alternatives":
         # [{"transcript": str, "confidence": float}]}, "start": float, "duration": float,
         # "speaker"/"words[].speaker" for diarization}. Real parsing lives here so the shape
         # is correct once the gate opens; unexercised, per module docstring.
         async for raw in self._ws:  # type: ignore[attr-defined]
             msg = json.loads(raw)
+            # Deepgram also sends `Metadata`/`SpeechStarted`/`UtteranceEnd` messages on the same
+            # socket; only `Results` (or an untyped message, as in older API versions and the
+            # existing tests) carries a transcript.
+            if msg.get("type", "Results") != "Results":
+                continue
             alt = msg.get("channel", {}).get("alternatives", [{}])[0]
             words = alt.get("words", [])
             speaker = str(words[0]["speaker"]) if words and "speaker" in words[0] else "0"
@@ -96,6 +132,16 @@ class _DeepgramStream:
             )
 
     async def close(self) -> None:
+        # CloseStream asks Deepgram to flush the pending final and then close the socket
+        # itself; give it a moment to do so (the pump keeps reading meanwhile, see
+        # `SessionTracker._stop_participant`) before forcing the close.
+        try:
+            await self._ws.send(_CLOSE_STREAM_MESSAGE)  # type: ignore[attr-defined]
+            wait_closed = getattr(self._ws, "wait_closed", None)
+            if wait_closed is not None:
+                await asyncio.wait_for(wait_closed(), timeout=_CLOSE_FLUSH_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 - already closed or flush timed out; close anyway
+            pass
         await self._ws.close()  # type: ignore[attr-defined]
 
 
@@ -110,14 +156,29 @@ class DeepgramProvider:
         self._api_key = api_key
 
     async def open_stream(
-        self, *, org_id: str, meeting_id: str, region: str, diarize: bool = True
+        self,
+        *,
+        org_id: str,
+        meeting_id: str,
+        region: str,
+        diarize: bool = True,
+        encoding: str = DEFAULT_ENCODING,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
     ) -> TranscriptionStream:
         # THE enforcement point (compliance.py docstring): checked first, before anything else
         # touches the network or the key.
         assert_compliance_gate_green()
 
         endpoint = deepgram_endpoint_for_region(region)
-        params = {"diarize": "true" if diarize else "false", "interim_results": "true"}
+        # Raw PCM carries no container header, so Deepgram must be told the encoding, rate and
+        # channel count explicitly or it cannot decode a single frame.
+        params = {
+            "diarize": "true" if diarize else "false",
+            "interim_results": "true",
+            "encoding": encoding,
+            "sample_rate": str(sample_rate),
+            "channels": "1",
+        }
         url = f"{endpoint}?{urlencode(params)}"
         ws = await websockets.connect(
             url, additional_headers={"Authorization": f"Token {self._api_key}"}

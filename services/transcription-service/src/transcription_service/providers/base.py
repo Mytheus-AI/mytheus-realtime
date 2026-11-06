@@ -4,6 +4,18 @@ one real-but-unexercisable binding, one deterministic fake, one config-selected 
 function. Keeps Deepgram swappable so a DPA-constrained tenant can be pinned to self-hosted
 Whisper later ([10 section 3.3](../../../mytheus-docs/10-realtime-and-transcription.md))
 without touching callers.
+
+Audio IN: `TranscriptionStream.send_audio` is the inbound half of the stream (the
+`/internal/audio` connection pushes raw PCM through it, see `audio_in.py`). Before it existed
+the Protocol was outbound-only -- a stream manufactured utterances from nothing, and a real
+Deepgram socket would have received silence (`mytheus-docs/worksplit/spec/spec-audio.md`
+task 7).
+
+Drops: a binding signals "the vendor connection died abnormally and can be re-opened" by
+raising `ProviderStreamDropped`, from either `send_audio` or the `utterances()` iterator. A
+CLEAN end of `utterances()` (the iterator simply finishing) means the stream is over and is
+never retried. `providers/resilient.py` builds reconnect-with-backoff on exactly that
+distinction, so a binding must not raise `ProviderStreamDropped` for a deliberate close.
 """
 
 from __future__ import annotations
@@ -11,6 +23,16 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
+
+# The one audio format the `/internal/audio` contract admits (see `audio_in.py`): 16 kHz,
+# mono, signed 16-bit little-endian PCM. `linear16` is Deepgram's name for that encoding.
+DEFAULT_ENCODING = "linear16"
+DEFAULT_SAMPLE_RATE = 16000
+
+
+class ProviderStreamDropped(Exception):
+    """The provider connection was lost abnormally (network error, vendor-side close with an
+    error code). Retryable: `ReconnectingStream` re-opens the stream with backoff."""
 
 
 @dataclass(frozen=True)
@@ -45,10 +67,21 @@ class TranscriptionStream(Protocol):
         """Yields interim and final `Utterance`s for the lifetime of the stream."""
         ...
 
+    async def send_audio(self, frame: bytes) -> None:
+        """Forwards one raw PCM frame (format fixed at `open_stream`) to the provider."""
+        ...
+
     async def close(self) -> None: ...
 
 
 class TranscriptionProvider(Protocol):
     async def open_stream(
-        self, *, org_id: str, meeting_id: str, region: str, diarize: bool = True
+        self,
+        *,
+        org_id: str,
+        meeting_id: str,
+        region: str,
+        diarize: bool = True,
+        encoding: str = DEFAULT_ENCODING,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
     ) -> TranscriptionStream: ...

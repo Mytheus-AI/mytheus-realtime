@@ -18,7 +18,7 @@ import { pubsubChannel } from "../../../libs/keys";
 import type { JoinAck } from "../src/server";
 import { connectClient, startTestApp, type TestApp } from "./helpers/testApp";
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 const SAMPLES = 200;
 
 describe("caption bridge latency — the gateway's own leg only", () => {

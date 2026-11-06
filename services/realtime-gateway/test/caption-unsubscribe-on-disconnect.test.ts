@@ -26,7 +26,7 @@ import { connectClient, createFakePresenceEventsProducer } from "./helpers/testA
 import { startFakeCoreApi, type FakeCoreApi } from "./helpers/fakeCoreApi";
 import { startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 
 describe("caption channel unsubscribe survives a presence-removal failure on disconnect", () => {
   let app: App;
@@ -47,7 +47,7 @@ describe("caption channel unsubscribe survives a presence-removal failure on dis
         redisUrl: REDIS_URL,
         coreApiUrl: coreApi.baseUrl,
         redpandaBrokers: ["localhost:9092"],
-        schemaRegistryUrl: "http://localhost:8081",
+        schemaRegistryUrl: "http://localhost:8085",
       },
       { jwtVerifier, presenceEventsProducer: createFakePresenceEventsProducer() },
     );

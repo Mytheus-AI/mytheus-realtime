@@ -1,5 +1,5 @@
 """Shared fixtures for tests that hit the real local infra (per the task brief: Postgres
-`mytheus-backend-postgres-1` on host port 5433 db `mytheus`, Redis 6380, Redpanda 9092, Schema
+`mytheus-backend-postgres-1` on host port 5443 db `mytheus`, Redis 6390, Redpanda 9092, Schema
 Registry 8081). Nothing here is mocked -- these are genuinely the services this program's
 `docker compose` brings up, matching this repo's own testing convention
 ("Mock these in tests: LiveKit ... Deepgram ... and Redis pub/sub" -- notably NOT Postgres or
@@ -22,11 +22,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from transcription_service.db import make_engine, make_session_factory
 
 TEST_DATABASE_URL = os.environ.get(
-    "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5433/mytheus"
+    "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5443/mytheus"
 )
-TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6380")
+TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6390")
 TEST_REDPANDA_BROKERS = os.environ.get("TEST_REDPANDA_BROKERS", "localhost:9092")
-TEST_SCHEMA_REGISTRY_URL = os.environ.get("TEST_SCHEMA_REGISTRY_URL", "http://localhost:8081")
+TEST_SCHEMA_REGISTRY_URL = os.environ.get("TEST_SCHEMA_REGISTRY_URL", "http://localhost:8085")
 
 
 @pytest_asyncio.fixture

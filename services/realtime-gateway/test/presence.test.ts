@@ -1,5 +1,5 @@
 /**
- * Presence set behavior against the real dev Redis (localhost:6380), not a mock — this is the
+ * Presence set behavior against the real dev Redis (localhost:6390), not a mock — this is the
  * store presence lives in and nowhere else (ephemeral, never a durable table).
  *
  * Covers the heartbeat/ZSET mechanics directly (fast, no process spawning): freshness filtering
@@ -15,7 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { presenceIndexKey, presenceKey } from "../../../libs/keys";
 import { heartbeat, listPresence, removeMember, sweepStalePresence } from "../src/presence";
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 const STALE_AFTER_MS = 1000;
 
 describe("presence set (real Redis)", () => {

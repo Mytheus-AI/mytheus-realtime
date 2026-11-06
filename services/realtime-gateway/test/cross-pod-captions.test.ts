@@ -28,7 +28,7 @@ import { startFakeCoreApi, type FakeCoreApi } from "./helpers/fakeCoreApi";
 import { startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
 
 const REPO_ROOT = path.resolve(__dirname, "..");
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 const SERVER_ENTRY = path.join(
   REPO_ROOT,
   "dist",
@@ -81,7 +81,7 @@ describe("cross-pod caption fan-out (two separate processes, one Redis pub/sub m
         CORE_API_URL: coreApi.baseUrl,
         CLERK_JWKS_URL: jwks.jwksUrl,
         REDPANDA_BROKERS: process.env.REDPANDA_BROKERS ?? "localhost:9092",
-        SCHEMA_REGISTRY_URL: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8081",
+        SCHEMA_REGISTRY_URL: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8085",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });

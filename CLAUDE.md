@@ -122,21 +122,22 @@ Mock these in tests: LiveKit (the server-side audio hook / internal WS), Deepgra
 Both stacks plus local infra:
 
 ```bash
-# 1. Local infra: Redis + Redpanda + Schema Registry
-docker compose up -d
+# 1. Local infra (Postgres 5443, Redis 6390, Redpanda 9092, Schema Registry 8081) comes from
+#    mytheus-backend's compose; this repo has none of its own
+(cd ../mytheus-backend && docker compose up -d)
 
-# 2. realtime-gateway (Node 20+)
+# 2. realtime-gateway (Node 20+), port 8090
+(cd libs && npm install)
 cd services/realtime-gateway
 npm install
-npm run dev
+npm run build && npm start        # PORT=8090; CORE_API_URL=http://localhost:8002
 npm run lint && npm test          # test includes WS fan-out load tests
 
-# 3. transcription-service (Python 3.11+)
+# 3. transcription-service (Python 3.11+, uv), port 8091
 cd services/transcription-service
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-uvicorn app.main:app --reload --port 8081
-ruff check . && black --check . && pytest
+uv sync
+uv run uvicorn transcription_service.main:app --reload --port 8091
+uv run ruff check . && uv run black --check . && uv run mypy . && uv run pytest
 ```
 
 Dev keys: a LiveKit dev URL + API key/secret (audio hook and validation) and a Deepgram dev API key (kept server-side).

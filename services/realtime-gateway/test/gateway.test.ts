@@ -1,6 +1,6 @@
 /**
  * In-process integration tests for the handshake, room-join authz, presence, chat relay, and
- * caption-transport paths. One real App instance (real HTTP + Socket.io + real Redis at :6380),
+ * caption-transport paths. One real App instance (real HTTP + Socket.io + real Redis at :6390),
  * a real fake-JWKS server, and a real fake-core-api server — only the presence-events producer is
  * an in-memory double here (the real-broker assertion lives in test/presence-events-kafka.test.ts,
  * and the real cross-*process* fan-out lives in test/cross-pod-fanout.test.ts).
@@ -19,7 +19,7 @@ import {
   type TestApp,
 } from "./helpers/testApp";
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 
 describe("realtime-gateway handshake + room join + presence + chat + captions", () => {
   let t: TestApp;

@@ -3,16 +3,31 @@
 available to this build (compliance gate condition 1 is unmet), so this is what makes the
 interim-vs-final pipeline, redaction, persistence, and production testable end-to-end without
 one. Deterministic and dependency-free; every call is recorded so tests can assert what was
-opened and with what region/diarize arguments.
+opened and with what region/diarize arguments, and every audio frame a stream receives is
+recorded on that stream (`FakeProvider.streams[i].frames`).
+
+Two script modes:
+
+- default (`emit_on_audio=False`): the stream yields its whole script immediately, regardless
+  of audio -- the shape every pre-existing test relies on.
+- `emit_on_audio=True`: the stream yields ONE script item per received audio frame, so a test
+  can prove that bytes pushed into `/internal/audio` are what drives captions and finals.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 
-from .base import TranscriptionProvider, TranscriptionStream, Utterance
+from .base import (
+    DEFAULT_ENCODING,
+    DEFAULT_SAMPLE_RATE,
+    TranscriptionProvider,
+    TranscriptionStream,
+    Utterance,
+)
 
 
 @dataclass
@@ -21,6 +36,8 @@ class _RecordedOpen:
     meeting_id: str
     region: str
     diarize: bool
+    encoding: str = DEFAULT_ENCODING
+    sample_rate: int = DEFAULT_SAMPLE_RATE
 
 
 def default_script(chunk_id: str | None = None) -> list[Utterance]:
@@ -72,14 +89,33 @@ def default_script(chunk_id: str | None = None) -> list[Utterance]:
 @dataclass
 class _FakeStream:
     _script: Sequence[Utterance]
+    emit_on_audio: bool = False
     closed: bool = False
+    frames: list[bytes] = field(default_factory=list)
+    _ticks: asyncio.Queue[bool] = field(default_factory=asyncio.Queue)
 
     async def utterances(self) -> AsyncIterator[Utterance]:
+        if not self.emit_on_audio:
+            for u in self._script:
+                yield u
+            return
         for u in self._script:
+            more = await self._ticks.get()
+            if not more:
+                return
             yield u
+
+    async def send_audio(self, frame: bytes) -> None:
+        if self.closed:
+            return
+        self.frames.append(frame)
+        if self.emit_on_audio:
+            self._ticks.put_nowait(True)
 
     async def close(self) -> None:
         self.closed = True
+        # Unblocks an `emit_on_audio` iterator waiting for the next frame.
+        self._ticks.put_nowait(False)
 
 
 @dataclass
@@ -88,14 +124,35 @@ class FakeProvider:
     script: list[Utterance] | None = None
     """Override the default scripted sequence for a specific test; `None` uses
     `default_script()`."""
+    emit_on_audio: bool = False
+    streams: list[_FakeStream] = field(default_factory=list)
 
     async def open_stream(
-        self, *, org_id: str, meeting_id: str, region: str, diarize: bool = True
+        self,
+        *,
+        org_id: str,
+        meeting_id: str,
+        region: str,
+        diarize: bool = True,
+        encoding: str = DEFAULT_ENCODING,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
     ) -> TranscriptionStream:
         self.opens.append(
-            _RecordedOpen(org_id=org_id, meeting_id=meeting_id, region=region, diarize=diarize)
+            _RecordedOpen(
+                org_id=org_id,
+                meeting_id=meeting_id,
+                region=region,
+                diarize=diarize,
+                encoding=encoding,
+                sample_rate=sample_rate,
+            )
         )
-        return _FakeStream(_script=self.script if self.script is not None else default_script())
+        stream = _FakeStream(
+            _script=self.script if self.script is not None else default_script(),
+            emit_on_audio=self.emit_on_audio,
+        )
+        self.streams.append(stream)
+        return stream
 
 
 def _assert_conforms(_cls: type[TranscriptionProvider]) -> None:

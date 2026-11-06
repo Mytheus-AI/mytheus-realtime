@@ -2,7 +2,7 @@
  * Acceptance check #1 — "the canonical hard test": two sockets for the same `meeting_id`,
  * connected to two SEPARATE gateway *processes*, both receive a chat and a presence event. This
  * spawns two real `node` child processes running the actual compiled server (built fresh in
- * `beforeAll`), both pointed at the same real Redis (:6380). A single in-process test with two
+ * `beforeAll`), both pointed at the same real Redis (:6390). A single in-process test with two
  * Socket.io client connections to one server would never exercise the `@socket.io/redis-adapter`
  * cross-pod path at all — this is why it has to be two processes.
  */
@@ -19,7 +19,7 @@ import { startFakeCoreApi, type FakeCoreApi } from "./helpers/fakeCoreApi";
 import { startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
 
 const REPO_ROOT = path.resolve(__dirname, "..");
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 const SERVER_ENTRY = path.join(
   REPO_ROOT,
   "dist",
@@ -70,7 +70,7 @@ describe("cross-pod fan-out (canonical hard test — two separate processes)", (
         CORE_API_URL: coreApi.baseUrl,
         CLERK_JWKS_URL: jwks.jwksUrl,
         REDPANDA_BROKERS: process.env.REDPANDA_BROKERS ?? "localhost:9092",
-        SCHEMA_REGISTRY_URL: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8081",
+        SCHEMA_REGISTRY_URL: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8085",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });

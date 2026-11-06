@@ -70,7 +70,10 @@ async def test_redelivered_joined_event_does_not_reopen_the_stream(
 
     assert first is True
     assert second is False, "the dedupe cache must reject the redelivered idempotency_key"
-    assert len(provider.opens) == 1
+    # `joined` opens the meeting-level session only; provider streams are opened per
+    # participant audio connection (`/internal/audio`), never by the consumer.
+    assert tracker.has_session(meeting_id)
+    assert provider.opens == []
 
 
 @pytest.mark.asyncio
