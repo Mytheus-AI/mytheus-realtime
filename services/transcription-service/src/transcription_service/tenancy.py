@@ -42,3 +42,17 @@ async def get_data_residency_region(session: AsyncSession, org_id: str) -> str:
     if row is None:
         return _DEFAULT_REGION
     return str(row[0])
+
+
+async def meeting_belongs_to_org(session: AsyncSession, org_id: str, meeting_id: str) -> bool:
+    """Tenant check for `/internal/audio`: the `meeting_id` the sender named must be a meeting
+    of the `org_id` it named. `meetings` is owned by `mytheus-backend` and RLS'd like every
+    tenant table; the explicit `org_id` predicate keeps the check correct even on a connection
+    that bypasses RLS (the local superuser, see `db.py`)."""
+    row = (
+        await session.execute(
+            text("SELECT 1 FROM meetings WHERE id = :meeting_id AND org_id = :org_id"),
+            {"meeting_id": meeting_id, "org_id": org_id},
+        )
+    ).first()
+    return row is not None

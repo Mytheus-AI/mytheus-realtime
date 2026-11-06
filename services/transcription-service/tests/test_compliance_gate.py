@@ -16,7 +16,11 @@ from transcription_service.compliance import (
 )
 from transcription_service.config import Settings
 from transcription_service.providers.deepgram import DeepgramProvider
-from transcription_service.providers.factory import select_provider
+from transcription_service.providers.factory import (
+    ProviderNotConfiguredError,
+    UnavailableProvider,
+    select_provider,
+)
 from transcription_service.providers.fake import FakeProvider
 
 
@@ -59,20 +63,52 @@ async def test_no_env_var_can_reopen_the_gate(monkeypatch: pytest.MonkeyPatch) -
         assert_compliance_gate_green()
 
 
-def test_select_provider_defaults_to_fake_when_no_key() -> None:
-    settings = Settings(
-        database_url="",
-        redis_url="",
-        redpanda_brokers="",
-        schema_registry_url="",
-        transcription_ws_bind="",
-        deepgram_api_key=None,
-        livekit_url=None,
-        livekit_api_key=None,
-        livekit_api_secret=None,
-        otel_exporter_otlp_endpoint=None,
-    )
-    assert isinstance(select_provider(settings), FakeProvider)
+def _settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "database_url": "",
+        "redis_url": "",
+        "redpanda_brokers": "",
+        "schema_registry_url": "",
+        "transcription_ws_bind": "",
+        "deepgram_api_key": None,
+        "livekit_url": None,
+        "livekit_api_key": None,
+        "livekit_api_secret": None,
+        "otel_exporter_otlp_endpoint": None,
+    }
+    values.update(overrides)
+    return Settings(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_select_provider_fails_closed_when_no_key_and_no_dev_flag() -> None:
+    """No key and no TRANSCRIPTION_ALLOW_FAKE_PROVIDER=1: the fake must NOT be selected (it
+    would persist scripted text for a real meeting). The fail-closed binding refuses."""
+    provider = select_provider(_settings())
+    assert isinstance(provider, UnavailableProvider)
+    with pytest.raises(ProviderNotConfiguredError):
+        await provider.open_stream(org_id="org-1", meeting_id="meeting-1", region="us")
+
+
+def test_select_provider_uses_fake_only_with_the_explicit_dev_flag() -> None:
+    assert isinstance(select_provider(_settings(allow_fake_provider=True)), FakeProvider)
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("1", True), ("", False), ("0", False), ("true", False)]
+)
+def test_dev_flag_env_parsing_is_exactly_1(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+) -> None:
+    from transcription_service.config import load_settings_from_env
+
+    monkeypatch.setenv("TRANSCRIPTION_ALLOW_FAKE_PROVIDER", value)
+    assert load_settings_from_env().allow_fake_provider is expected
+
+
+def test_a_key_wins_over_the_dev_flag() -> None:
+    provider = select_provider(_settings(deepgram_api_key="dg_x", allow_fake_provider=True))
+    assert isinstance(provider, DeepgramProvider)
 
 
 @pytest.mark.asyncio
