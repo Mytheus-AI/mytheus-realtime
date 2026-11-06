@@ -25,6 +25,7 @@ import { Namespace, Server, type Socket } from "socket.io";
 import { createClerkJwtVerifier, type ClerkJwtVerifier } from "../../../libs/auth";
 import { presenceKey, pubsubChannel, roomName } from "../../../libs/keys";
 import { createCoreApiClient, type CoreApiClient } from "./coreApiClient";
+import { handleMetricsRequest, setClientCountSource } from "./metrics";
 import { heartbeat, listPresence, removeMember, sweepStalePresence } from "./presence";
 import {
   createPresenceEventsProducer,
@@ -186,6 +187,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   const sweepIntervalMs = config.presenceSweepIntervalMs ?? 20_000;
 
   const httpServer = createServer((req, res) => {
+    if (handleMetricsRequest(req, res)) return;
     if (req.url === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "ok", service: "realtime-gateway" }));
@@ -196,6 +198,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   });
 
   const io = new Server(httpServer, { path: "/socket.io" });
+  setClientCountSource(() => io.engine.clientsCount);
 
   // Cross-instance fan-out via Redis. lazyConnect + error handlers keep the process (and
   // /healthz) alive even when Redis is unreachable; the adapter reconnects when Redis returns.
