@@ -42,7 +42,7 @@ export interface TestApp {
   stop(): Promise<void>;
 }
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 
 export async function startTestApp(): Promise<TestApp> {
   const jwks = await startFakeJwksServer();
@@ -56,7 +56,7 @@ export async function startTestApp(): Promise<TestApp> {
       redisUrl: REDIS_URL,
       coreApiUrl: coreApi.baseUrl,
       redpandaBrokers: ["localhost:9092"],
-      schemaRegistryUrl: "http://localhost:8081",
+      schemaRegistryUrl: "http://localhost:8085",
     },
     { jwtVerifier, presenceEventsProducer },
   );

@@ -1,7 +1,7 @@
 /**
  * Acceptance check #4: presence set grows on join / shrinks on disconnect, and one
  * `presence-events` record is produced per transition, partitioned by `org_id` — asserted against
- * the real broker (Redpanda at localhost:9092, Schema Registry at localhost:8081), not a mock.
+ * the real broker (Redpanda at localhost:9092, Schema Registry at localhost:8085), not a mock.
  * This test uses the real `presenceEventsProducer` (unlike test/gateway.test.ts, which uses an
  * in-memory double for speed) and drives it through the actual join/disconnect socket flow.
  */
@@ -19,9 +19,9 @@ import { connectClient } from "./helpers/testApp";
 import { startFakeCoreApi, type FakeCoreApi } from "./helpers/fakeCoreApi";
 import { startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 const REDPANDA_BROKERS = (process.env.REDPANDA_BROKERS ?? "localhost:9092").split(",");
-const SCHEMA_REGISTRY_URL = process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8081";
+const SCHEMA_REGISTRY_URL = process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8085";
 
 interface DecodedPresenceEvent {
   header: { org_id: string; producer: string; idempotency_key: string };

@@ -36,7 +36,7 @@ import { connectClient, createFakePresenceEventsProducer } from "./helpers/testA
 import { startFakeCoreApi, type FakeCoreApi } from "./helpers/fakeCoreApi";
 import { startFakeJwksServer, type FakeJwksServer } from "./helpers/fakeJwks";
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6380";
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 const REMOVE_MEMBER_DELAY_MS = 200;
 
 interface RecordedLog {
@@ -96,7 +96,7 @@ describe("App.stop() drains a concurrently-slow disconnect cleanup before discon
         redisUrl: REDIS_URL,
         coreApiUrl: coreApi.baseUrl,
         redpandaBrokers: ["localhost:9092"],
-        schemaRegistryUrl: "http://localhost:8081",
+        schemaRegistryUrl: "http://localhost:8085",
       },
       { jwtVerifier, presenceEventsProducer: createFakePresenceEventsProducer(), logger },
     );

@@ -122,7 +122,7 @@ Mock these in tests: LiveKit (the server-side audio hook / internal WS), Deepgra
 Both stacks plus local infra:
 
 ```bash
-# 1. Local infra (Postgres 5433, Redis 6380, Redpanda 9092, Schema Registry 8081) comes from
+# 1. Local infra (Postgres 5443, Redis 6390, Redpanda 9092, Schema Registry 8081) comes from
 #    mytheus-backend's compose; this repo has none of its own
 (cd ../mytheus-backend && docker compose up -d)
 

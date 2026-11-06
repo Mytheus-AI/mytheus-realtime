@@ -7,7 +7,7 @@ is exactly the kind of thing this test class exists to catch).
 
 `mytheus_app`'s dev password (`scripts/bootstrap_roles.py` in `mytheus-backend`) is the role
 name itself, `mytheus_app`, and is already set on this shared local Postgres instance
-(verified: `PGPASSWORD=mytheus_app psql -U mytheus_app -h localhost -p 5433 -d mytheus`
+(verified: `PGPASSWORD=mytheus_app psql -U mytheus_app -h localhost -p 5443 -d mytheus`
 connects). A real deployment's `mytheus_app` password is operator-set and out of this test's
 reach; local dev/CI is where this empirical check can actually run.
 """

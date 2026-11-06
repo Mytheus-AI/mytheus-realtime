@@ -596,7 +596,7 @@ export function loadConfigFromEnv(): AppConfig {
     redisUrl: process.env.REDIS_URL ?? "redis://localhost:6379",
     coreApiUrl: process.env.CORE_API_URL ?? "http://localhost:8000",
     redpandaBrokers: (process.env.REDPANDA_BROKERS ?? "localhost:9092").split(","),
-    schemaRegistryUrl: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8081",
+    schemaRegistryUrl: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8085",
     // Optional operational tuning; unset means "use the production default" (see AppConfig doc
     // comments). Exposed via env mainly so tests can drive fast heartbeat/stale/sweep cycles
     // against a real spawned process instead of waiting out the multi-second production defaults.

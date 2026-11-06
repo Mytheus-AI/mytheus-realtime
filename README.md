@@ -59,11 +59,11 @@ mytheus-realtime/
 
 **Run**
 
-This repo has no compose file of its own: local Postgres (host port 5433), Redis (6380),
+This repo has no compose file of its own: local Postgres (host port 5443), Redis (6390),
 Redpanda (9092) and Schema Registry (8081) come from `mytheus-backend`'s `docker compose`.
 
 ```bash
-# 1. Local infra, from the mytheus-backend checkout (Postgres 5433, Redis 6380, Redpanda 9092)
+# 1. Local infra, from the mytheus-backend checkout (Postgres 5443, Redis 6390, Redpanda 9092)
 (cd ../mytheus-backend && docker compose up -d)
 
 # 2. Shared libs + realtime-gateway (Node) on port 8090

@@ -61,7 +61,7 @@ def load_settings_from_env() -> Settings:
         ),
         redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"),
         redpanda_brokers=os.environ.get("REDPANDA_BROKERS", "localhost:9092"),
-        schema_registry_url=os.environ.get("SCHEMA_REGISTRY_URL", "http://localhost:8081"),
+        schema_registry_url=os.environ.get("SCHEMA_REGISTRY_URL", "http://localhost:8085"),
         transcription_ws_bind=os.environ.get("TRANSCRIPTION_WS_BIND", "0.0.0.0:8091"),
         deepgram_api_key=os.environ.get("DEEPGRAM_API_KEY") or None,
         livekit_url=os.environ.get("LIVEKIT_URL") or None,

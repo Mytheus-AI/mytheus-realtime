@@ -24,5 +24,5 @@ Two services in two stacks that scale on different signals (`realtime-gateway` o
 
 ### Verification (all green)
 
-- gateway: `npm install` (38 pkgs, 0 vulns) → `npm run build` compiles TS clean → boot smoke: `/healthz` → `200 {"status":"ok","service":"realtime-gateway"}`, unknown path → `404`, Redis adapter connected (smoke pointed at the isolated dev Redis on `:6380` so no other local project was disturbed).
+- gateway: `npm install` (38 pkgs, 0 vulns) → `npm run build` compiles TS clean → boot smoke: `/healthz` → `200 {"status":"ok","service":"realtime-gateway"}`, unknown path → `404`, Redis adapter connected (smoke pointed at the isolated dev Redis on `:6390` so no other local project was disturbed).
 - transcription-service: `ruff` clean, `black --check` clean, `mypy .` clean (`strict`, 2 files), `pytest -q` 2 passed; boot smoke: `/healthz` → `200`, `/internal/audio` WS accepted+closed.
