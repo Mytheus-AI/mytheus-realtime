@@ -120,12 +120,27 @@ async def test_mytheus_app_with_no_current_org_set_sees_nothing(
 
 @pytest.mark.asyncio
 async def test_mytheus_app_cannot_query_a_partition_directly(
-    app_role_session_factory, two_tenants: dict[str, str]
+    app_role_session_factory, two_tenants: dict[str, str], engine: AsyncEngine
 ) -> None:
     """Empirical proof fix round 1 item 3 actually blocks the escape, not just structurally
     (no grants in `information_schema`): `mytheus_app` naming the current month's partition
     directly must be refused by Postgres itself, regardless of `app.current_org`."""
-    partition = f"transcript_chunks_{date.today().strftime('%Y_%m')}"
+    # Name a partition that actually exists (the migration premakes months around its own run
+    # date, so "this month" may be absent on a long-lived dev DB and rows already sit in the
+    # DEFAULT partition, which blocks creating an overlapping one). Prefer the current month.
+    async with engine.connect() as admin:
+        names = [
+            r[0]
+            for r in await admin.execute(
+                text(
+                    "SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid "
+                    "WHERE i.inhparent = 'transcript_chunks'::regclass ORDER BY c.relname"
+                )
+            )
+        ]
+    assert names, "transcript_chunks has no partitions"
+    current = f"transcript_chunks_{date.today().strftime('%Y_%m')}"
+    partition = current if current in names else names[-1]
     async with app_role_session_factory() as session:
         async with session.begin():
             await set_current_org(session, two_tenants["org_a"])
