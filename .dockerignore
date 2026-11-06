@@ -1,0 +1,39 @@
+# One build context (the repo root) serves both service Dockerfiles. Anything listed here can
+# never enter an image, which is the point: no env file or credential may be baked in.
+.git
+.gitignore
+.gitattributes
+.worktrees
+.github
+.pre-commit-config.yaml
+.idea
+.vscode
+.DS_Store
+
+# Environment / secrets (every spelling: .env, .env.local, .env.example, foo.env, *.pem, *.key)
+**/.env
+**/.env.*
+**/*.env
+**/*.pem
+**/*.key
+
+# Dependencies and build output are produced inside the image, never copied from the host.
+**/node_modules
+**/dist
+**/build
+**/.venv
+**/venv
+**/__pycache__
+**/*.py[cod]
+**/*.tsbuildinfo
+**/.mypy_cache
+**/.ruff_cache
+**/.pytest_cache
+**/coverage
+
+# Tests and docs are not shipped.
+**/test
+**/tests
+**/*.md
+system.md
+Makefile
