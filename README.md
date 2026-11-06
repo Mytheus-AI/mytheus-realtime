@@ -93,6 +93,27 @@ pytest                         # transcription-service
 | `TRANSCRIPTION_WS_BIND` | transcription-service | Internal WS bind for the LiveKit audio hook |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | both | OpenTelemetry traces/metrics export |
 
+## Container images
+
+Two images, built from the **repo root** (one root `.dockerignore` keeps every env file out of both). CI (`.github/workflows/images.yml`) builds them on every PR and pushes `:main` and `:<git sha>` to GHCR on merge to `main`.
+
+| Image | Dockerfile | Port | Runs |
+|---|---|---|---|
+| `ghcr.io/mytheus-ai/mytheus-realtime-gateway` | `services/realtime-gateway/Dockerfile` | 8090 | `node dist/services/realtime-gateway/src/server.js` (Node 22, user `node`) |
+| `ghcr.io/mytheus-ai/mytheus-transcription` | `services/transcription-service/Dockerfile` | 8091 | `uvicorn transcription_service.main:app --host 0.0.0.0 --port 8091` (Python 3.12, uid 10001) |
+
+```bash
+docker build -f services/realtime-gateway/Dockerfile -t mytheus-realtime-gateway .
+docker build -f services/transcription-service/Dockerfile -t mytheus-transcription .
+
+# Config comes from the environment only (see Environment variables); nothing is baked in.
+docker run --rm -p 8090:8090 -e REDIS_URL=... -e REDPANDA_BROKERS=... -e SCHEMA_REGISTRY_URL=... -e CLERK_JWKS_URL=... mytheus-realtime-gateway
+docker run --rm -p 8091:8091 -e DATABASE_URL=... -e REDIS_URL=... -e REDPANDA_BROKERS=... -e SCHEMA_REGISTRY_URL=... mytheus-transcription
+
+# One-off migration of transcript_chunks from the same image (not run by the compose today):
+docker run --rm -e DATABASE_URL=... mytheus-transcription alembic upgrade head
+```
+
 ## Testing
 
 - **`realtime-gateway`** - Node test runner for unit/integration; **load/soak tests** for WS fan-out (many concurrent connections per `meeting_id` room, cross-pod Redis pub/sub delivery, reconnect storms, backpressure/dropped-frame behavior).
