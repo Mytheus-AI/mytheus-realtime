@@ -45,6 +45,7 @@ def test_deepgram_provider_has_no_auto_repr_leak() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_closed")
 async def test_gate_refusal_error_never_contains_the_key(caplog: pytest.LogCaptureFixture) -> None:
     secret = "dg_super_secret_value_98765"
     provider = DeepgramProvider(api_key=secret)

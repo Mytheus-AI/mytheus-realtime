@@ -194,10 +194,11 @@ def test_init_timeout_closes_4408() -> None:
 # ---------------------------------------------------------------- compliance gate
 
 
+@pytest.mark.usefixtures("gate_closed")
 def test_compliance_gate_closed_drops_audio_and_emits_nothing() -> None:
     """A real (Deepgram) provider is selected: the gate is checked before ANY database read,
-    audit write or provider contact, and the connection closes 4451. The gate constant stays
-    False -- nothing here flips or bypasses it."""
+    audit write or provider contact, and the connection closes 4451. The gate is closed by
+    the `gate_closed` fixture (the source constant is open for the college project)."""
     provider = DeepgramProvider(api_key="dg_test_key_never_used")
     h = Harness(provider=provider)
     assert h.hub.provider_mode == audio_in.PROVIDER_EXTERNAL
