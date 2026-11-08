@@ -24,6 +24,11 @@ import { Namespace, Server, type Socket } from "socket.io";
 
 import { createClerkJwtVerifier, type ClerkJwtVerifier } from "../../../libs/auth";
 import { presenceKey, pubsubChannel, roomName } from "../../../libs/keys";
+import {
+  createAgentOutputConsumer,
+  type AgentOutputConsumer,
+  type AgentPubsubMessage,
+} from "./agentOutput";
 import { createCoreApiClient, type CoreApiClient } from "./coreApiClient";
 import { handleMetricsRequest, setClientCountSource } from "./metrics";
 import { heartbeat, listPresence, removeMember, sweepStalePresence } from "./presence";
@@ -84,6 +89,18 @@ import {
 //                                          gateway — a reconnecting client gets nothing from
 //                                          before it (re)joined; finals are re-hydrated from
 //                                          core-api's REST read model, never from this socket.
+//
+//   "agent-delta" ({ meetingId, payload: { windowId, seq, delta, done } }) and
+//   "agent-note"  ({ meetingId, payload: { windowId, agent, content, confidence,
+//                   relevanceScore, sourceChunkIds } })
+//                                       — PersonalListenerAgent output (Plan 7-9 section 3.4,
+//                                          mytheus-docs ADR-0030 D5), bridged from `agent-stream`
+//                                          and `agent-results` by agentOutput.ts. PRIVATE: emitted
+//                                          only to this pod's sockets on the meeting channel whose
+//                                          resolved internal user id is the note's owner, never to
+//                                          the room. Deltas are volatile (shed first under
+//                                          backpressure); a note is a reliable emit. Neither is
+//                                          replayed: re-hydrate from core-api's worklogs route.
 //
 // Disconnect: presence is removed from every meeting the socket had joined, "presence" is
 // re-broadcast per meeting, and a "leave" `presence-events` record is produced per meeting. This
@@ -152,6 +169,9 @@ export interface AppConfig {
   /** How often the reconciliation sweep runs, reaping stale entries left behind by a pod that
    * died without running its `disconnect` handler. Production default 20s. */
   presenceSweepIntervalMs?: number;
+  /** Consume `agent-stream`/`agent-results` and bridge them to sockets. On in production
+   * (`AGENT_OUTPUT_ENABLED`, default on); off by default for in-process tests. */
+  agentOutput?: boolean;
 }
 
 export interface AppDeps {
@@ -159,6 +179,8 @@ export interface AppDeps {
   jwtVerifier: ClerkJwtVerifier;
   coreApiClient?: CoreApiClient;
   presenceEventsProducer?: PresenceEventsProducer;
+  /** Overrides the Redpanda agent-output bridge; built from config when `agentOutput` is on. */
+  agentOutputConsumer?: AgentOutputConsumer;
   logger?: Logger;
 }
 
@@ -212,6 +234,17 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   subClient.on("error", (err) => logger.error({ err }, "redis sub client error"));
   captionSubClient.on("error", (err) => logger.error({ err }, "redis caption-sub client error"));
   io.adapter(createAdapter(pubClient, subClient, { key: "nexus" }));
+
+  const agentOutputConsumer =
+    deps.agentOutputConsumer ??
+    (config.agentOutput
+      ? createAgentOutputConsumer({
+          brokers: config.redpandaBrokers,
+          schemaRegistryUrl: config.schemaRegistryUrl,
+          publisher: pubClient,
+          logger,
+        })
+      : undefined);
 
   const nsp = io.of("/v1");
 
@@ -272,6 +305,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       logger.warn({ channel }, "discarding malformed message on caption channel");
       return;
     }
+    if (msg.type === "agent-delta" || msg.type === "agent-note") {
+      deliverAgentOutput(channel, localSockets, msg as AgentPubsubMessage);
+      return;
+    }
     if (msg.type !== "caption") return;
     // `meetingId` is ALWAYS derived from the channel string, never from the message body: the
     // channel is the authenticated fact (it's what this process subscribed to, tied to the
@@ -294,6 +331,24 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       socket.emit("caption", outbound);
     }
   });
+
+  function deliverAgentOutput(
+    channel: string,
+    localSockets: Set<Socket>,
+    msg: AgentPubsubMessage,
+  ): void {
+    const meetingId = extractMeetingId(channel);
+    if (meetingId === null || typeof msg.userId !== "string" || msg.userId.length === 0) return;
+    const outbound = { meetingId, payload: msg.payload };
+    for (const socket of localSockets) {
+      if ((socket.data as SocketData).presenceUserId !== msg.userId) continue;
+      if (msg.type === "agent-delta") {
+        socket.volatile.emit("agent-delta", outbound);
+      } else {
+        socket.emit("agent-note", outbound);
+      }
+    }
+  }
 
   function extractMeetingId(channel: string): string | null {
     const match = /^nexus:(.+):pubsub:meeting:(.+)$/.exec(channel);
@@ -541,6 +596,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     nsp,
     async start() {
       await presenceEventsProducer.connect();
+      await agentOutputConsumer?.start();
       sweepTimer = setInterval(() => {
         runPresenceSweep().catch((err: unknown) => logger.error({ err }, "presence sweep failed"));
       }, sweepIntervalMs);
@@ -554,6 +610,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     },
     async stop() {
       clearInterval(sweepTimer);
+      await agentOutputConsumer?.stop();
       await io.close();
       // `io.close()`'s own callback does not wait for each socket's async `disconnect` handler
       // to finish (Node's EventEmitter fires listeners without awaiting them) — those handlers
@@ -603,6 +660,7 @@ export function loadConfigFromEnv(): AppConfig {
     presenceHeartbeatIntervalMs: envInt("PRESENCE_HEARTBEAT_INTERVAL_MS"),
     presenceStaleAfterMs: envInt("PRESENCE_STALE_AFTER_MS"),
     presenceSweepIntervalMs: envInt("PRESENCE_SWEEP_INTERVAL_MS"),
+    agentOutput: process.env.AGENT_OUTPUT_ENABLED !== "0",
   };
 }
 
