@@ -1,7 +1,7 @@
-"""The compliance gate itself: since condition 1 (signed Deepgram DPA/SCC) is unmet,
-`transcription-service` must refuse to open a stream against real audio, and it must be
-IMPOSSIBLE to configure it into doing so -- not merely discouraged by a comment (task brief,
-resolution #1)."""
+"""The compliance gate itself. The source constant is open for the college project (see
+`compliance.py`); every closed-gate test here closes it with the `gate_closed` fixture, so
+when the gate is closed again before real users, `transcription-service` is known to refuse
+to open a stream against real audio, and no configuration can reopen it."""
 
 from __future__ import annotations
 
@@ -24,17 +24,20 @@ from transcription_service.providers.factory import (
 from transcription_service.providers.fake import FakeProvider
 
 
-def test_gate_is_closed_today() -> None:
-    """Condition 1 does not exist; the gate must be False in source, not True."""
-    assert COMPLIANCE_GATE_GREEN is False
+def test_gate_is_open_for_the_college_project() -> None:
+    """Opened in source on purpose (no DPA signed). Flip back to False before outside users."""
+    assert COMPLIANCE_GATE_GREEN is True
+    assert_compliance_gate_green()
 
 
+@pytest.mark.usefixtures("gate_closed")
 def test_assert_compliance_gate_green_raises() -> None:
     with pytest.raises(ComplianceGateClosedError):
         assert_compliance_gate_green()
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_closed")
 async def test_deepgram_provider_refuses_to_open_stream_and_never_touches_the_network() -> None:
     """The refusal happens BEFORE any network I/O -- proven by patching `websockets.connect`
     to a mock that would fail the test if it were ever called, then asserting the gate error
@@ -49,6 +52,7 @@ async def test_deepgram_provider_refuses_to_open_stream_and_never_touches_the_ne
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_closed")
 async def test_no_env_var_can_reopen_the_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     """Even a deliberately hostile environment (every plausible override name someone might
     try) cannot flip the gate -- because there is no config surface that feeds it at all."""
@@ -112,6 +116,7 @@ def test_a_key_wins_over_the_dev_flag() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("gate_closed")
 async def test_select_provider_with_a_key_configured_still_refuses_on_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

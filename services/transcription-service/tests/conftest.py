@@ -110,3 +110,11 @@ async def tenant(
                 await session.execute(
                     text("DELETE FROM organizations WHERE id = :org_id"), {"org_id": org_id}
                 )
+
+
+@pytest.fixture
+def gate_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Close the compliance gate for one test. The source constant is open for the college
+    project (see `compliance.py`), but the closed-gate behaviour must stay tested so that
+    closing it again before real users is a one-line change that is known to work."""
+    monkeypatch.setattr("transcription_service.compliance.COMPLIANCE_GATE_GREEN", False)

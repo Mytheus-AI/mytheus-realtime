@@ -36,7 +36,12 @@ from __future__ import annotations
 
 from typing import Final
 
-COMPLIANCE_GATE_GREEN: Final[bool] = False
+# OPEN FOR THE COLLEGE PROJECT (2026-11-08, maintainer's decision). Condition 1 is NOT met:
+# no Deepgram DPA/SCC is signed. Mytheus is currently a college major project whose calls carry
+# only the team and classmates who know their audio goes to Deepgram, so the maintainer chose
+# to open the gate without it. Conditions 2 and 3 stay enforced in code. Set this back to
+# False before any outside user or customer joins a call, and sign the DPA before reopening.
+COMPLIANCE_GATE_GREEN: Final[bool] = True
 
 
 class ComplianceGateClosedError(RuntimeError):
