@@ -72,9 +72,16 @@ def _bounds(y: int, m: int) -> tuple[str, str]:
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
     for y, m in _months():
         start, end = _bounds(y, m)
         p = f"{TABLE}_{y:04d}_{m:02d}"
+        # `be66698dbefb` premakes three months from `date.today()`, so on a database built from
+        # empty in or after 2026-11 some of these months already exist. Creating one again
+        # fails the whole upgrade with DuplicateTableError; an existing month is already
+        # correct (same bounds, owner-only ACL from that migration), so skip it.
+        if bind.exec_driver_sql(f"SELECT to_regclass('public.{p}')").scalar() is not None:
+            continue
         op.execute(f"LOCK TABLE {DEFAULT} IN ACCESS EXCLUSIVE MODE;")
         op.execute(f"CREATE TEMP TABLE _spill (LIKE {TABLE});")
         op.execute(
