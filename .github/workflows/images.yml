@@ -52,3 +52,66 @@ jobs:
           # One cache scope per image so the two builds do not evict each other.
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  deploy:
+    # Deploy THIS repo's new image, after it is pushed. Without this job an image-only change
+    # reached production only if another repo's deploy happened to pull `:main` after the push:
+    # on 2026-11-09 the platform and backend deploys pulled at 17:48:59 and 17:50:36 and this
+    # repo's image was pushed at 17:50:45, so production kept the old one while every check
+    # was green. Same forced-command key and the same steps as mytheus-backend's deploy job:
+    # the credential can trigger a redeploy of current main and nothing else.
+    #
+    # The three secrets (VPS_DEPLOY_KEY, VPS_KNOWN_HOSTS, VPS_HOST) carry the same values as in
+    # mytheus-backend. Until they are set here, the job says so and stops without failing: the
+    # image is published either way.
+    needs: [image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-vps
+      cancel-in-progress: false
+    env:
+      HAVE_DEPLOY_KEY: ${{ secrets.VPS_DEPLOY_KEY != '' && secrets.VPS_HOST != '' && secrets.VPS_KNOWN_HOSTS != '' }}
+    steps:
+      - name: deploy credentials present
+        id: creds
+        run: |
+          if [ "$HAVE_DEPLOY_KEY" = "true" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::VPS_DEPLOY_KEY / VPS_KNOWN_HOSTS / VPS_HOST are not set in this repository: the image was published but NOT deployed. Set them (same values as mytheus-backend) to deploy on push."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: configure ssh
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_DEPLOY_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.VPS_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: deploy
+        # No command argument: the key's forced command (/usr/local/sbin/mytheus-deploy.sh)
+        # decides what runs, `docker compose up -d --pull always` among it.
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o ConnectTimeout=30 \
+              root@${{ secrets.VPS_HOST }}
+
+      - name: verify the deployed API serves traffic
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /tmp/body -m 20 -w '%{http_code}' https://api.mytheus.cloud/healthz || echo 000)
+            if [ "$code" = "200" ]; then echo "healthz OK: $(cat /tmp/body)"; exit 0; fi
+            echo "attempt $i: HTTP $code"; sleep 10
+          done
+          echo "::error::api.mytheus.cloud/healthz did not return 200 after the deploy"
+          exit 1
