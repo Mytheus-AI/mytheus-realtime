@@ -119,7 +119,9 @@ async def handle_meeting_room_event(
     Raises `PoisonMessage` if the header or body cannot be safely applied."""
     _validate(event)
     header = event["header"]
-    org_id = header["org_id"]
+    # The Avro decoder yields `uuid.UUID` for `logicalType: uuid`; everything downstream (the
+    # `set_config` bind, Redis keys, the session map) is keyed by the string form.
+    org_id = str(header["org_id"])
     idempotency_key = header["idempotency_key"]
 
     accepted = await redis.set(
@@ -129,7 +131,7 @@ async def handle_meeting_room_event(
         logger.info("meeting-room-events: duplicate %s, skipping", idempotency_key)
         return False
 
-    meeting_id = event["meeting_id"]
+    meeting_id = str(event["meeting_id"])
     event_type = event["event_type"]
 
     if event_type == "joined":

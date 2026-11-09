@@ -148,3 +148,25 @@ async def test_value_that_does_not_decode_to_a_record_is_dead_lettered(
 
     assert len(dlq.produced) == 1
     assert dlq.produced[0]["topic"] == "meeting-room-events.dlq"
+
+
+@pytest.mark.asyncio
+async def test_avro_decoded_uuid_ids_open_the_session(
+    session_factory, redis_client, tenant: dict[str, str]
+) -> None:
+    """The real `AvroDeserializer` decodes `logicalType: uuid` fields to `uuid.UUID`, not
+    `str`. Passed straight to `set_config`, asyncpg refused it, the exception escaped the poll
+    loop, and the consumer died for the life of the pod: no meeting opened a session again and
+    every audio connection was closed. Ids are normalised to `str` at the boundary."""
+    org_id, meeting_id = tenant["org_id"], tenant["meeting_id"]
+    tracker = SessionTracker(
+        provider=FakeProvider(script=[]), session_factory=session_factory, redis=redis_client
+    )
+    event = _joined_event(
+        org_id=org_id, meeting_id=meeting_id, idempotency_key=f"meetingroom:{uuid.uuid4()}"
+    )
+    event["header"]["org_id"] = uuid.UUID(org_id)  # type: ignore[index]
+    event["meeting_id"] = uuid.UUID(meeting_id)
+
+    assert await handle_meeting_room_event(tracker, redis_client, event) is True
+    assert tracker.has_session(meeting_id)
