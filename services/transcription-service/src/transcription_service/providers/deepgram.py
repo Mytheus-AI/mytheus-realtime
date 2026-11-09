@@ -152,8 +152,10 @@ class DeepgramProvider:
     `tests/test_deepgram_key_never_leaks.py`.
     """
 
-    def __init__(self, *, api_key: str) -> None:
+    def __init__(self, *, api_key: str, model: str = "nova-3", language: str = "multi") -> None:
         self._api_key = api_key
+        self._model = model
+        self._language = language
 
     async def open_stream(
         self,
@@ -173,6 +175,18 @@ class DeepgramProvider:
         # Raw PCM carries no container header, so Deepgram must be told the encoding, rate and
         # channel count explicitly or it cannot decode a single frame.
         params = {
+            # No model named means Deepgram's older default; Nova-3 is the accurate one, and
+            # `multi` handles English/Hindi code-switching in a single stream.
+            "model": self._model,
+            "language": self._language,
+            # Readable captions and transcript lines: punctuation, casing, numbers and dates.
+            "punctuate": "true",
+            "smart_format": "true",
+            # A final after 300 ms of silence keeps finals (and the agent windows built from
+            # them) prompt; utterance_end_ms closes a turn even when background noise defeats
+            # silence detection. Both need interim_results, which captions use anyway.
+            "endpointing": "300",
+            "utterance_end_ms": "1000",
             "diarize": "true" if diarize else "false",
             "interim_results": "true",
             "encoding": encoding,
