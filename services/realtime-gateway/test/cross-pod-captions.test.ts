@@ -80,6 +80,9 @@ describe("cross-pod caption fan-out (two separate processes, one Redis pub/sub m
         REDIS_URL,
         CORE_API_URL: coreApi.baseUrl,
         CLERK_JWKS_URL: jwks.jwksUrl,
+        // not under test here; keeps these spawned (and SIGKILLed) pods out of the shared
+        // agent-output consumer group, where a dead member stalls agent-output-kafka.test.ts
+        AGENT_OUTPUT_ENABLED: "0",
         REDPANDA_BROKERS: process.env.REDPANDA_BROKERS ?? "localhost:9092",
         SCHEMA_REGISTRY_URL: process.env.SCHEMA_REGISTRY_URL ?? "http://localhost:8085",
       },

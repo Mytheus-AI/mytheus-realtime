@@ -121,6 +121,9 @@ describe("presence survives an ungraceful pod death (real SIGKILL, two real proc
         REDIS_URL,
         CORE_API_URL: coreApi.baseUrl,
         CLERK_JWKS_URL: jwks.jwksUrl,
+        // not under test here; keeps these spawned (and SIGKILLed) pods out of the shared
+        // agent-output consumer group, where a dead member stalls agent-output-kafka.test.ts
+        AGENT_OUTPUT_ENABLED: "0",
         REDPANDA_BROKERS,
         SCHEMA_REGISTRY_URL,
         PRESENCE_HEARTBEAT_INTERVAL_MS: String(HEARTBEAT_INTERVAL_MS),
