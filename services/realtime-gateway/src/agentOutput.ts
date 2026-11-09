@@ -24,11 +24,15 @@
  *     UUID `id` and a string `content` (none left: skipped). These are meeting-scoped: the
  *     message has no `userId` and server.ts delivers it to every local socket on the channel.
  *     Candidates are proposals only; nothing is confirmed here (core-api owns confirm).
+ *   - `agent-results` `QuestionAgent`/`suggestion` records as "agent-suggestion", carrying only
+ *     the suggestions with `surfaced === true`, a UUID `id`, a string `question` and a priority
+ *     of 1, 2 or 3 (none left: skipped). PRIVATE like notes (ADR-0034 D6): tagged with the
+ *     owner's `userId`, delivered only to that user's sockets, never to the room.
  *   Anything else (other agents, other kinds, a header without a UUID tenant) is skipped.
  *
  * Nothing is buffered or replayed: a client that reconnects re-hydrates notes from
  * `GET /api/v1/meetings/:id/worklogs?user_id=me` and candidates from
- * `GET /api/v1/meetings/:id/candidates`.
+ * `GET /api/v1/meetings/:id/candidates`, suggestions from `GET /api/v1/suggestions?meeting_id=`.
  */
 import { SchemaRegistry } from "@kafkajs/confluent-schema-registry";
 import { Kafka, type Consumer } from "kafkajs";
@@ -92,9 +96,35 @@ export type AgentCandidatePayload =
       candidates: ActionCandidate[];
     };
 
+/** One grounding source of a suggestion (mytheus-docs ADR-0033 D3: four kinds). */
+export interface SuggestionCitation {
+  kind: "transcript" | "document" | "decision" | "action";
+  [field: string]: string | number;
+}
+
+/** A surfaced QuestionAgent suggestion (mytheus-docs ADR-0034 D3). */
+export interface QuestionSuggestion {
+  id: string;
+  question: string;
+  priority: 1 | 2 | 3;
+  confidence: number;
+  surfaced: true;
+  rationale: string | null;
+  citations: SuggestionCitation[];
+}
+
+export interface AgentSuggestionPayload {
+  windowId: string;
+  agent: "QuestionAgent";
+  kind: "suggestion";
+  suggestions: QuestionSuggestion[];
+}
+
 export type AgentPubsubMessage =
   | { type: "agent-delta"; userId: string; payload: AgentDeltaPayload }
   | { type: "agent-note"; userId: string; payload: AgentNotePayload }
+  // Private to its owner, like notes (ADR-0034 D6).
+  | { type: "agent-suggestion"; userId: string; payload: AgentSuggestionPayload }
   // Meeting-scoped: no userId, delivered to every local socket on the meeting channel.
   | { type: "agent-candidate"; payload: AgentCandidatePayload };
 
@@ -177,6 +207,56 @@ function candidateRecord(windowId: string, value: Decoded): AgentCandidatePayloa
   };
 }
 
+const CITATION_KINDS = new Set(["transcript", "document", "decision", "action"]);
+
+function citations(raw: unknown): SuggestionCitation[] {
+  if (!Array.isArray(raw)) return [];
+  const out: SuggestionCitation[] = [];
+  for (const c of raw as unknown[]) {
+    if (c === null || typeof c !== "object" || !CITATION_KINDS.has((c as Decoded).kind as string)) {
+      continue;
+    }
+    const kept: Record<string, string | number> = {};
+    for (const [k, v] of Object.entries(c as Decoded)) {
+      if (typeof v === "string" || typeof v === "number") kept[k] = v;
+    }
+    out.push(kept as SuggestionCitation);
+  }
+  return out;
+}
+
+function suggestionRecord(windowId: string, value: Decoded): AgentSuggestionPayload | null {
+  if (value.agent !== "QuestionAgent" || value.kind !== "suggestion") return null;
+  const payload = parsePayload(value.payload_json);
+  if (!payload || !Array.isArray(payload.suggestions)) return null;
+  const kept: QuestionSuggestion[] = [];
+  for (const raw of payload.suggestions as unknown[]) {
+    if (raw === null || typeof raw !== "object") continue;
+    const s = raw as Decoded;
+    const priority = s.priority;
+    if (
+      s.surfaced !== true ||
+      typeof s.id !== "string" ||
+      !UUID_RE.test(s.id) ||
+      typeof s.question !== "string" ||
+      (priority !== 1 && priority !== 2 && priority !== 3)
+    ) {
+      continue;
+    }
+    kept.push({
+      id: s.id,
+      question: s.question,
+      priority,
+      confidence: typeof s.confidence === "number" ? s.confidence : 0,
+      surfaced: true,
+      rationale: str(s.rationale),
+      citations: citations(s.citations),
+    });
+  }
+  if (kept.length === 0) return null;
+  return { windowId, agent: "QuestionAgent", kind: "suggestion", suggestions: kept };
+}
+
 /** Pure mapping from one decoded Avro value to the pub/sub message, or null to skip it. */
 export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMessage | null {
   const header = (value.header ?? {}) as Decoded;
@@ -207,6 +287,10 @@ export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMess
   if (topic === "agent-results") {
     const candidate = candidateRecord(windowId, value);
     if (candidate) return { channel, message: { type: "agent-candidate", payload: candidate } };
+    const suggestion = suggestionRecord(windowId, value);
+    if (suggestion) {
+      return { channel, message: { type: "agent-suggestion", userId, payload: suggestion } };
+    }
     if (value.agent !== "PersonalListenerAgent" || value.kind !== "note") return null;
     const payload = parsePayload(value.payload_json);
     if (payload?.surfaced !== true) return null;

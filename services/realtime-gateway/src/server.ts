@@ -102,6 +102,14 @@ import {
 //                                          backpressure); a note is a reliable emit. Neither is
 //                                          replayed: re-hydrate from core-api's worklogs route.
 //
+//   "agent-suggestion" ({ meetingId, payload: { windowId, agent, kind, suggestions } })
+//                                       — QuestionAgent `suggestion` output (mytheus-docs
+//                                          ADR-0034), bridged from `agent-results` by
+//                                          agentOutput.ts. PRIVATE like "agent-note": emitted
+//                                          only to the owner's sockets, never to the room.
+//                                          Not replayed: re-hydrate from core-api's
+//                                          GET /api/v1/suggestions?meeting_id=.
+//
 //   "agent-candidate" ({ meetingId, payload: { windowId, agent, kind, candidates } })
 //                                       — DecisionAgent `decision_candidate` / ActionAgent
 //                                          `action_candidate` output (Phase 8 Part A contract
@@ -325,7 +333,11 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       deliverAgentCandidate(channel, localSockets, msg as AgentPubsubMessage);
       return;
     }
-    if (msg.type === "agent-delta" || msg.type === "agent-note") {
+    if (
+      msg.type === "agent-delta" ||
+      msg.type === "agent-note" ||
+      msg.type === "agent-suggestion"
+    ) {
       deliverAgentOutput(channel, localSockets, msg as AgentPubsubMessage);
       return;
     }
@@ -366,7 +378,8 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       if (msg.type === "agent-delta") {
         socket.volatile.emit("agent-delta", outbound);
       } else {
-        socket.emit("agent-note", outbound);
+        // a note or a suggestion: private to its owner, a reliable emit
+        socket.emit(msg.type, outbound);
       }
     }
   }
