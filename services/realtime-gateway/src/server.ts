@@ -102,6 +102,22 @@ import {
 //                                          backpressure); a note is a reliable emit. Neither is
 //                                          replayed: re-hydrate from core-api's worklogs route.
 //
+//   "agent-candidate" ({ meetingId, payload: { windowId, agent, kind, candidates } })
+//                                       — DecisionAgent `decision_candidate` / ActionAgent
+//                                          `action_candidate` output (Phase 8 Part A contract
+//                                          section 3), bridged from `agent-results` by
+//                                          agentOutput.ts. MEETING-SCOPED: emitted (reliable, not
+//                                          volatile) to EVERY socket of this pod joined to the
+//                                          meeting; the org-scoped channel keeps it inside the
+//                                          tenant even when another org's meeting has the same
+//                                          id. `candidates` holds only `surfaced: true` entries
+//                                          ({ id, content, confidence, surfaced, rationale,
+//                                          stakeholder_ids } for decisions; { id, content,
+//                                          confidence, surfaced, assignee_id, due_date,
+//                                          depends_on } for actions). Proposals only: confirm and
+//                                          dismiss go through core-api. Not replayed: re-hydrate
+//                                          from GET /api/v1/meetings/:id/candidates.
+//
 // Disconnect: presence is removed from every meeting the socket had joined, "presence" is
 // re-broadcast per meeting, and a "leave" `presence-events` record is produced per meeting. This
 // is the GRACEFUL path — it requires this process to still be alive to run it. Presence is also
@@ -305,6 +321,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       logger.warn({ channel }, "discarding malformed message on caption channel");
       return;
     }
+    if (msg.type === "agent-candidate") {
+      deliverAgentCandidate(channel, localSockets, msg as AgentPubsubMessage);
+      return;
+    }
     if (msg.type === "agent-delta" || msg.type === "agent-note") {
       deliverAgentOutput(channel, localSockets, msg as AgentPubsubMessage);
       return;
@@ -337,6 +357,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     localSockets: Set<Socket>,
     msg: AgentPubsubMessage,
   ): void {
+    if (msg.type === "agent-candidate") return;
     const meetingId = extractMeetingId(channel);
     if (meetingId === null || typeof msg.userId !== "string" || msg.userId.length === 0) return;
     const outbound = { meetingId, payload: msg.payload };
@@ -347,6 +368,22 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       } else {
         socket.emit("agent-note", outbound);
       }
+    }
+  }
+
+  // Meeting-scoped candidates: every local socket on this (org-scoped) channel gets them. The
+  // channel, not the body, is the tenant fact, exactly as for captions above.
+  function deliverAgentCandidate(
+    channel: string,
+    localSockets: Set<Socket>,
+    msg: AgentPubsubMessage,
+  ): void {
+    if (msg.type !== "agent-candidate") return;
+    const meetingId = extractMeetingId(channel);
+    if (meetingId === null) return;
+    const outbound = { meetingId, payload: msg.payload };
+    for (const socket of localSockets) {
+      socket.emit("agent-candidate", outbound);
     }
   }
 
