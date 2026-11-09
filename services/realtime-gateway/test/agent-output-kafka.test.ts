@@ -1,7 +1,8 @@
 /**
  * Agent output against the real broker: real Avro `agent-results` and `agent-stream` records on
  * Redpanda (localhost:9092, Schema Registry localhost:8085) go through the gateway's real
- * consumer and reach only the owner's socket. Complements test/agent-output.test.ts, which
+ * consumer and reach only the owner's socket, and a real `decision_candidate` record reaches
+ * every participant of its meeting (Phase 8 Part A section 3). Complements test/agent-output.test.ts, which
  * injects on the Redis channel directly.
  */
 import { randomUUID } from "node:crypto";
@@ -182,5 +183,88 @@ describe("agent output from the real broker to the owner's socket", () => {
     expect(note[1].meetingId).toBe(meetingId);
     expect(note[1].payload.content).toBe("- You own the migration, due Friday.");
     expect(got.bob).toEqual([]);
+  }, 90_000);
+
+  it("delivers a real decision_candidate record to every participant, surfaced only", async () => {
+    const orgId = randomUUID();
+    const meetingId = randomUUID();
+    const clerkOrg = `org-${randomUUID()}`;
+    const aliceSocket = await join(clerkOrg, meetingId, orgId, randomUUID());
+    const bobSocket = await join(clerkOrg, meetingId, orgId, randomUUID());
+    // same org, a different meeting: must not see it
+    const carolSocket = await join(clerkOrg, randomUUID(), orgId, randomUUID());
+    const got: Record<string, unknown[]> = { alice: [], bob: [], carol: [] };
+    aliceSocket.on("agent-candidate", (e) => got.alice.push(e));
+    bobSocket.on("agent-candidate", (e) => got.bob.push(e));
+    carolSocket.on("agent-candidate", (e) => got.carol.push(e));
+
+    const resultsId = await registry.getLatestSchemaId("agent-results-value");
+    const windowId = `${meetingId}:2`;
+    const surfacedId = randomUUID();
+    const stakeholder = randomUUID();
+    const value = await registry.encode(resultsId, {
+      header: header(orgId, `agentresult:${meetingId}:${windowId}:${stakeholder}:DecisionAgent`),
+      meeting_id: meetingId,
+      window_id: windowId,
+      user_id: stakeholder,
+      agent: "DecisionAgent",
+      kind: "decision_candidate",
+      relevance_score: 0.8,
+      confidence: 0.86,
+      content: "Ship the beta on 2 December",
+      payload_json: JSON.stringify({
+        candidates: [
+          {
+            id: surfacedId,
+            content: "Ship the beta on 2 December",
+            confidence: 0.86,
+            surfaced: true,
+            rationale: "QA signed off; marketing needs a week",
+            stakeholder_ids: [stakeholder],
+          },
+          {
+            id: randomUUID(),
+            content: "Maybe move standup",
+            confidence: 0.5,
+            surfaced: false,
+            rationale: null,
+            stakeholder_ids: [],
+          },
+        ],
+        prompt: "decision_agent@v1",
+        model_tier: "sonnet",
+      }),
+      source_chunk_ids: [randomUUID()],
+    });
+
+    // the consumer group may still be joining if this test runs alone; resend until seen (the
+    // payload is identical, so a redelivery only repeats the same candidate)
+    const deadline = Date.now() + 30_000;
+    while ((got.alice.length === 0 || got.bob.length === 0) && Date.now() < deadline) {
+      await producer.send({ topic: "agent-results", messages: [{ key: orgId, value }] });
+      await sleep(1500);
+    }
+    await sleep(500);
+    const expected = {
+      meetingId,
+      payload: {
+        windowId,
+        agent: "DecisionAgent",
+        kind: "decision_candidate",
+        candidates: [
+          {
+            id: surfacedId,
+            content: "Ship the beta on 2 December",
+            confidence: 0.86,
+            surfaced: true,
+            rationale: "QA signed off; marketing needs a week",
+            stakeholder_ids: [stakeholder],
+          },
+        ],
+      },
+    };
+    expect(got.alice[0]).toEqual(expected);
+    expect(got.bob[0]).toEqual(expected);
+    expect(got.carol).toEqual([]);
   }, 90_000);
 });
