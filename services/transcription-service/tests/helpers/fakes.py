@@ -101,6 +101,14 @@ class FakeDatabase:
                 if r["topic"] == params["topic"] and r["idempotency_key"] == params["ik"]
             ]
             return _Result(ids)
+        if "MAX(end_ms)" in sql:
+            # Where this meeting's saved transcript ends, under the session's RLS org.
+            ends = [
+                int(r["end_ms"])
+                for r in self.transcript_chunks
+                if r["_rls_org"] == org and r["meeting_id"] == params["m"]
+            ]
+            return _Result([(max(ends, default=0),)])
         if "INSERT INTO transcript_chunks" in sql:
             self._check(org, params["org_id"])
             self.transcript_chunks.append({**params, "_rls_org": org})

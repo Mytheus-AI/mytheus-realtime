@@ -40,12 +40,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 
 from redis.asyncio import Redis
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .audit import record_session_decision
@@ -76,7 +78,21 @@ class ParticipantLease:
     connection_id: str
     stream: ReconnectingStream
     pump_task: asyncio.Task[None] | None = None
+    # Where this participant's stream sits on the meeting timeline, in ms: added to every time
+    # the stream reports (see `meeting_timeline`).
+    meeting_offset_ms: int = 0
     superseded: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+def meeting_timeline(lease: ParticipantLease, start_ms: int, end_ms: int) -> tuple[int, int]:
+    """Place one utterance on the meeting's timeline.
+
+    Each participant has their own provider stream, whose clock starts at zero when that
+    participant's audio connects (`ReconnectingStream` already keeps it continuous across
+    reconnects, from the audio actually sent). Without an offset everyone's lines sat near
+    00:00. The offset is fixed when the participant joins: how far into the meeting that was.
+    """
+    return start_ms + lease.meeting_offset_ms, end_ms + lease.meeting_offset_ms
 
 
 @dataclass
@@ -86,6 +102,10 @@ class _MeetingSession:
     pii_redaction_enabled: bool
     hint_count: int = 0
     participants: dict[str, ParticipantLease] = field(default_factory=dict)
+    started_at: float = field(default_factory=time.monotonic)
+    # The transcript time this session continues from: the meeting's last saved line, so a
+    # meeting everyone left and rejoined does not restart at 00:00.
+    base_ms: int = 0
 
 
 @dataclass
@@ -189,6 +209,11 @@ class SessionTracker:
                 await self._stop_participant(previous)
 
             region = meeting.region
+            # The participant who opens the meeting is its zero (plus where an earlier
+            # session's transcript ended); anyone joining later starts that far in.
+            offset_ms = meeting.base_ms + (
+                0 if opened_here else int((time.monotonic() - meeting.started_at) * 1000)
+            )
 
             async def _open_inner() -> TranscriptionStream:
                 # Region pin applies to the first connection and to every reconnect.
@@ -209,6 +234,7 @@ class SessionTracker:
                 participant_identity=participant_identity,
                 connection_id=str(uuid.uuid4()),
                 stream=stream,
+                meeting_offset_ms=offset_ms,
             )
             lease.pump_task = asyncio.create_task(
                 self._pump(lease, pii_redaction_enabled=meeting.pii_redaction_enabled)
@@ -251,6 +277,17 @@ class SessionTracker:
                 await set_current_org(session, org_id)
                 region = await get_data_residency_region(session, org_id)
                 pii_redaction_enabled = await get_pii_redaction_enabled(session, org_id)
+                base_ms = int(
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT COALESCE(MAX(end_ms), 0) FROM transcript_chunks "
+                                "WHERE meeting_id = :m"
+                            ),
+                            {"m": meeting_id},
+                        )
+                    ).scalar_one()
+                )
                 # Compliance gate acceptance check: "an audit-log entry records the
                 # redaction-toggle and any cross-border decision" — same transaction as the
                 # reads above, so the audit entry and the decision it records can never drift.
@@ -262,7 +299,10 @@ class SessionTracker:
                     pii_redaction_enabled=pii_redaction_enabled,
                 )
         meeting = _MeetingSession(
-            org_id=org_id, region=region, pii_redaction_enabled=pii_redaction_enabled
+            org_id=org_id,
+            region=region,
+            pii_redaction_enabled=pii_redaction_enabled,
+            base_ms=base_ms,
         )
         self._sessions[meeting_id] = meeting
         return meeting
@@ -293,12 +333,22 @@ class SessionTracker:
         logged, never allowed to crash the event loop silently."""
         try:
             async for utterance in lease.stream.utterances():
+                # Silence and breath come back as results with no words. Saving them filled
+                # transcripts with blank lines; captioning them showed a name with no text.
+                if not utterance.text.strip():
+                    continue
+                start_ms, end_ms = meeting_timeline(lease, utterance.start_ms, utterance.end_ms)
                 await process_utterance(
                     session_factory=self.session_factory,
                     redis=self.redis,
                     org_id=lease.org_id,
                     meeting_id=lease.meeting_id,
-                    utterance=replace(utterance, speaker_id=lease.participant_identity),
+                    utterance=replace(
+                        utterance,
+                        speaker_id=lease.participant_identity,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                    ),
                     pii_redaction_enabled=pii_redaction_enabled,
                 )
         except asyncio.CancelledError:

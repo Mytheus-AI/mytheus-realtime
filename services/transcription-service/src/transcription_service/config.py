@@ -48,6 +48,11 @@ class Settings:
     audio_max_frame_bytes: int = DEFAULT_AUDIO_MAX_FRAME_BYTES
     audio_queue_max_frames: int = DEFAULT_AUDIO_QUEUE_MAX_FRAMES
     allow_fake_provider: bool = False
+    # Deepgram model and language. Nova-3 is Deepgram's most accurate streaming model, and
+    # "multi" is its code-switching mode (English and Hindi mixed in one stream, as calls here
+    # are). Overridable without a release, e.g. DEEPGRAM_LANGUAGE=en for English-only.
+    deepgram_model: str = "nova-3"
+    deepgram_language: str = "multi"
 
     def __repr__(self) -> str:
         # Never print secrets (DB URL credentials, provider keys, the audio token).
@@ -64,6 +69,8 @@ def load_settings_from_env() -> Settings:
         schema_registry_url=os.environ.get("SCHEMA_REGISTRY_URL", "http://localhost:8085"),
         transcription_ws_bind=os.environ.get("TRANSCRIPTION_WS_BIND", "0.0.0.0:8091"),
         deepgram_api_key=os.environ.get("DEEPGRAM_API_KEY") or None,
+        deepgram_model=os.environ.get("DEEPGRAM_MODEL") or "nova-3",
+        deepgram_language=os.environ.get("DEEPGRAM_LANGUAGE") or "multi",
         livekit_url=os.environ.get("LIVEKIT_URL") or None,
         livekit_api_key=os.environ.get("LIVEKIT_API_KEY") or None,
         livekit_api_secret=os.environ.get("LIVEKIT_API_SECRET") or None,

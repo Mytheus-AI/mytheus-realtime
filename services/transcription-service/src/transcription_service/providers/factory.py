@@ -54,7 +54,11 @@ class UnavailableProvider:
 
 def select_provider(settings: Settings) -> TranscriptionProvider:
     if settings.deepgram_api_key:
-        return DeepgramProvider(api_key=settings.deepgram_api_key)
+        return DeepgramProvider(
+            api_key=settings.deepgram_api_key,
+            model=settings.deepgram_model,
+            language=settings.deepgram_language,
+        )
     if settings.allow_fake_provider:
         return FakeProvider()
     return UnavailableProvider()
