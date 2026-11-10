@@ -29,18 +29,25 @@
  *                                                                 gateway uses on core-api calls
  *   "candidate-resolved" ({ meetingId, candidateId, outcome })    outcome: confirmed|edited|dismissed
  *   "candidate-lock"     ({ meetingId, candidateId, locked })     ack adds `holder` when refused
- *   "agenda-status"      ({ meetingId, itemId })                  after the host's PATCH succeeded
+ *   "agenda-status"      ({ meetingId, itemId } | { meetingId, itemIds })
+ *                                                                 after the host's PATCH (mark,
+ *                                                                 extend) or "Start next" succeeded
  *   "hand"               ({ meetingId, raised })
  *   "reaction"           ({ meetingId, reaction })                one of REACTIONS
  *   "end-meeting"        ({ meetingId })                          after the host's PATCH succeeded
+ *   "wrap-up"            ({ meetingId })                          after the host opened or
+ *                                                                 cancelled the 60 s wrap-up
  *
  * Server -> client, to everyone in the meeting (`{ meetingId, payload }`):
  *   "candidate-resolution" { candidateId, kind, outcome, byUserId, at, row }
  *   "candidate-lock"       { candidateId, byUserId | null, until | null }
- *   "agenda-status"        { item, byUserId, at }
+ *   "agenda-status"        { item, items, byUserId, at }   `items`: every stored row named, in
+ *                                                          agenda order; `item` is the first
+ *                                                          (kept for clients that read one)
  *   "hand"                 { userId, raised, at }
  *   "reaction"             { id, userId, reaction, at }
  *   "meeting-ended"        { byUserId, at }
+ *   "wrap-up"              { state: "started" | "cancelled", startedAt, endsAt, byUserId, at }
  * and to the joining socket only, right after a successful "join":
  *   "room-state"           { locks: [{ candidateId, byUserId, until }], hands: [{ userId, at }] }
  */
@@ -58,6 +65,10 @@ export const LOCK_TTL_MS = 90_000;
 /** A quiet meeting's lock and hand hashes disappear on their own after this long. */
 const HASH_TTL_MS = 6 * 60 * 60 * 1000;
 export const REACTION_MIN_INTERVAL_MS = 600;
+/** The close-out wrap-up's length; the deadline is the stored start plus this. */
+export const WRAP_UP_MS = 60_000;
+/** "Start next" touches at most two items; a full-agenda update is still bounded (ADR-0038 D5). */
+const MAX_AGENDA_IDS = 20;
 export const REACTIONS = ["thumbs_up", "clap", "celebrate", "heart", "laugh", "thinking"] as const;
 export type Reaction = (typeof REACTIONS)[number];
 
@@ -109,6 +120,10 @@ const ID = /^[A-Za-z0-9_-]{1,80}$/;
 
 function isId(v: unknown): v is string {
   return typeof v === "string" && ID.test(v);
+}
+
+function iso(ms: number): string {
+  return new Date(ms).toISOString();
 }
 
 /** The person hosts the meeting or created it: the same rule core-api applies (ADR-0038 D6). */
@@ -375,11 +390,17 @@ export function createRoomEvents(deps: RoomEventsDeps) {
 
     socket.on(
       "agenda-status",
-      async (payload: { meetingId?: unknown; itemId?: unknown }, rawAck?: unknown) => {
+      async (
+        payload: { meetingId?: unknown; itemId?: unknown; itemIds?: unknown },
+        rawAck?: unknown,
+      ) => {
         const ack = safeAck(rawAck);
-        const { meetingId, itemId } = payload ?? {};
+        const { meetingId, itemId, itemIds } = payload ?? {};
         if (!joined(data, meetingId, ack)) return;
-        if (!isId(itemId)) {
+        // One item (a mark or an extend) or several ("Start next" finishes one and starts the
+        // next): every id must be well formed, and there must be at least one.
+        const ids = Array.isArray(itemIds) ? itemIds : [itemId];
+        if (ids.length === 0 || ids.length > MAX_AGENDA_IDS || !ids.every(isId)) {
           ack({ ok: false, error: "INVALID_PAYLOAD" });
           return;
         }
@@ -392,14 +413,21 @@ export function createRoomEvents(deps: RoomEventsDeps) {
           ack({ ok: false, error: "NOT_HOST" });
           return;
         }
-        const item = meeting.agenda.find((it) => it.id === itemId);
-        if (!item || item.status_source !== "host") {
+        const wanted = new Set(ids);
+        const items = meeting.agenda.filter((it) => wanted.has(it.id));
+        // Every named item must exist and be host-set in the stored agenda, or nothing is said.
+        if (items.length !== wanted.size || items.some((it) => it.status_source !== "host")) {
           ack({ ok: false, error: "NOT_VERIFIED" });
           return;
         }
         room(data, meetingId).emit("agenda-status", {
           meetingId,
-          payload: { item, byUserId: data.presenceUserId, at: new Date(now()).toISOString() },
+          payload: {
+            item: items[0],
+            items,
+            byUserId: data.presenceUserId,
+            at: new Date(now()).toISOString(),
+          },
         });
         ack({ ok: true });
       },
@@ -469,6 +497,29 @@ export function createRoomEvents(deps: RoomEventsDeps) {
       },
     );
 
+    socket.on("wrap-up", async (payload: { meetingId?: unknown }, rawAck?: unknown) => {
+      const ack = safeAck(rawAck);
+      const meetingId = payload?.meetingId;
+      if (!joined(data, meetingId, ack)) return;
+      const meeting = await coreApi.getMeeting({ meetingId, bearerToken: data.bearerToken });
+      if (!meeting) {
+        ack({ ok: false, error: "NOT_VERIFIED" });
+        return;
+      }
+      if (!steers(meeting, data.presenceUserId)) {
+        ack({ ok: false, error: "NOT_HOST" });
+        return;
+      }
+      // The stored wrap-up decides what the room hears: open (with its deadline) or closed.
+      const announced = wrapUpPayload(meeting, data.presenceUserId, now());
+      if (!announced) {
+        ack({ ok: false, error: "NOT_VERIFIED" });
+        return;
+      }
+      room(data, meetingId).emit("wrap-up", { meetingId, payload: announced });
+      ack({ ok: true, state: announced.state });
+    });
+
     socket.on("end-meeting", async (payload: { meetingId?: unknown }, rawAck?: unknown) => {
       const ack = safeAck(rawAck);
       const meetingId = payload?.meetingId;
@@ -496,6 +547,22 @@ export function createRoomEvents(deps: RoomEventsDeps) {
       });
       ack({ ok: true });
     });
+  }
+
+  /** The stored wrap-up as the room hears it, or null when the meeting is over. Pure. */
+  function wrapUpPayload(meeting: MeetingState, byUserId: string, at: number) {
+    if (meeting.status === "ended" || meeting.status === "cancelled") return null;
+    const started = meeting.wrap_up_started_at ? Date.parse(meeting.wrap_up_started_at) : NaN;
+    if (Number.isNaN(started)) {
+      return { state: "cancelled", startedAt: null, endsAt: null, byUserId, at: iso(at) };
+    }
+    return {
+      state: "started",
+      startedAt: iso(started),
+      endsAt: iso(started + WRAP_UP_MS),
+      byUserId,
+      at: iso(at),
+    };
   }
 
   /** Right after a successful join: the live locks and raised hands, to this socket only. */

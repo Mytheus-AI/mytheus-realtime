@@ -85,6 +85,8 @@ export interface FakeMeeting {
   host_user_id: string | null;
   created_by: string | null;
   agenda: Array<Record<string, unknown> & { id: string; status: string; status_source?: string }>;
+  wrap_up_started_at?: string | null;
+  wrap_up_by?: string | null;
 }
 
 export interface FakeCoreApi {

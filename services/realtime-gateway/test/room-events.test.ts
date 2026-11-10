@@ -110,6 +110,7 @@ describe("room-wide events", () => {
       ["hand", { meetingId, raised: true }],
       ["reaction", { meetingId, reaction: "clap" }],
       ["end-meeting", { meetingId }],
+      ["wrap-up", { meetingId }],
     ] as const) {
       expect(await emitAck(socket, event, payload)).toEqual({ ok: false, error: "NOT_JOINED" });
     }
@@ -308,6 +309,119 @@ describe("room-wide events", () => {
     expect(
       await emitAck(m.rajSocket, "agenda-status", { meetingId: m.meetingId, itemId: hostItem.id }),
     ).toEqual({ ok: false, error: "NOT_HOST" });
+    m.mayaSocket.close();
+    m.rajSocket.close();
+  });
+
+  it("broadcasts a host's multi-item change (Start next) only when every item is host-set", async () => {
+    const m = await meeting();
+    const done = { id: randomUUID(), title: "One", status: "covered", status_source: "host" };
+    const next = { id: randomUUID(), title: "Two", status: "in_progress", status_source: "host" };
+    const agentItem = {
+      id: randomUUID(),
+      title: "Three",
+      status: "pending",
+      status_source: "agent",
+    };
+    t.coreApi.setMeeting({
+      id: m.meetingId,
+      status: "live",
+      host_user_id: m.maya.id,
+      created_by: m.maya.id,
+      agenda: [done, next, agentItem],
+    });
+    const onRaj = collect(m.rajSocket, "agenda-status");
+    expect(
+      await emitAck(m.mayaSocket, "agenda-status", {
+        meetingId: m.meetingId,
+        itemIds: [done.id, next.id],
+      }),
+    ).toEqual({ ok: true });
+    await waitFor(() => onRaj.length === 1);
+    expect(onRaj[0]).toMatchObject({
+      payload: { item: done, items: [done, next], byUserId: m.maya.id },
+    });
+    // One unverifiable id and nothing is said; nor for an empty or malformed list.
+    expect(
+      await emitAck(m.mayaSocket, "agenda-status", {
+        meetingId: m.meetingId,
+        itemIds: [next.id, agentItem.id],
+      }),
+    ).toEqual({ ok: false, error: "NOT_VERIFIED" });
+    expect(
+      await emitAck(m.mayaSocket, "agenda-status", {
+        meetingId: m.meetingId,
+        itemIds: [next.id, randomUUID()],
+      }),
+    ).toEqual({ ok: false, error: "NOT_VERIFIED" });
+    for (const itemIds of [[], ["bad id!"], "nope"]) {
+      expect(
+        await emitAck(m.mayaSocket, "agenda-status", { meetingId: m.meetingId, itemIds }),
+      ).toEqual({ ok: false, error: "INVALID_PAYLOAD" });
+    }
+    expect(onRaj.length).toBe(1);
+    m.mayaSocket.close();
+    m.rajSocket.close();
+  });
+
+  it("tells the room about the host's wrap-up from the stored row, with one deadline", async () => {
+    const m = await meeting();
+    const onRaj = collect(m.rajSocket, "wrap-up");
+    const startedAt = "2026-11-11T10:00:00.000Z";
+    t.coreApi.setMeeting({
+      id: m.meetingId,
+      status: "live",
+      host_user_id: m.maya.id,
+      created_by: m.maya.id,
+      agenda: [],
+      wrap_up_started_at: startedAt,
+      wrap_up_by: m.maya.id,
+    });
+    expect(await emitAck(m.rajSocket, "wrap-up", { meetingId: m.meetingId })).toEqual({
+      ok: false,
+      error: "NOT_HOST",
+    });
+    expect(await emitAck(m.mayaSocket, "wrap-up", { meetingId: m.meetingId })).toEqual({
+      ok: true,
+      state: "started",
+    });
+    await waitFor(() => onRaj.length === 1);
+    expect(onRaj[0]).toMatchObject({
+      meetingId: m.meetingId,
+      payload: {
+        state: "started",
+        startedAt,
+        endsAt: "2026-11-11T10:01:00.000Z",
+        byUserId: m.maya.id,
+      },
+    });
+
+    t.coreApi.setMeeting({
+      id: m.meetingId,
+      status: "live",
+      host_user_id: m.maya.id,
+      created_by: m.maya.id,
+      agenda: [],
+      wrap_up_started_at: null,
+    });
+    expect(await emitAck(m.mayaSocket, "wrap-up", { meetingId: m.meetingId })).toEqual({
+      ok: true,
+      state: "cancelled",
+    });
+    await waitFor(() => onRaj.length === 2);
+    expect(onRaj[1]).toMatchObject({ payload: { state: "cancelled", endsAt: null } });
+
+    t.coreApi.setMeeting({
+      id: m.meetingId,
+      status: "ended",
+      host_user_id: m.maya.id,
+      created_by: m.maya.id,
+      agenda: [],
+    });
+    expect(await emitAck(m.mayaSocket, "wrap-up", { meetingId: m.meetingId })).toEqual({
+      ok: false,
+      error: "NOT_VERIFIED",
+    });
     m.mayaSocket.close();
     m.rajSocket.close();
   });
