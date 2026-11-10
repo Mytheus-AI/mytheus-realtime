@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net";
 import { io as ioClient, type Socket as ClientSocket } from "socket.io-client";
 
 import { createClerkJwtVerifier } from "../../../../libs/auth";
-import { createApp, type App } from "../../src/server";
+import { createApp, type App, type AppConfig } from "../../src/server";
 import type {
   PresenceEventsProducer,
   ProducePresenceEventParams,
@@ -44,7 +44,7 @@ export interface TestApp {
 
 const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6390";
 
-export async function startTestApp(): Promise<TestApp> {
+export async function startTestApp(overrides: Partial<AppConfig> = {}): Promise<TestApp> {
   const jwks = await startFakeJwksServer();
   const coreApi = await startFakeCoreApi();
   const presenceEventsProducer = createFakePresenceEventsProducer();
@@ -57,6 +57,7 @@ export async function startTestApp(): Promise<TestApp> {
       coreApiUrl: coreApi.baseUrl,
       redpandaBrokers: ["localhost:9092"],
       schemaRegistryUrl: "http://localhost:8085",
+      ...overrides,
     },
     { jwtVerifier, presenceEventsProducer },
   );

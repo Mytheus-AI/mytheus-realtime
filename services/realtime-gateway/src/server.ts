@@ -28,9 +28,12 @@ import {
   createAgentOutputConsumer,
   type AgentOutputConsumer,
   type AgentPubsubMessage,
+  type AlertQueuedNudge,
+  type RoutedAgentMessage,
 } from "./agentOutput";
+import { drainAlerts, enqueueAlert } from "./alertQueue";
 import { createCoreApiClient, type CoreApiClient } from "./coreApiClient";
-import { handleMetricsRequest, setClientCountSource } from "./metrics";
+import { alertsDelivered, deltasShed, handleMetricsRequest, setClientCountSource } from "./metrics";
 import { heartbeat, listPresence, removeMember, sweepStalePresence } from "./presence";
 import {
   createPresenceEventsProducer,
@@ -119,6 +122,20 @@ import {
 //                                          sockets, never to the room. Not replayed: re-hydrate
 //                                          from GET /api/v1/meetings/:id/context-fills.
 //
+//   "agent-alert" ({ meetingId, payload: { id, meetingId, alertType, priority, title, body,
+//                   confidence, rationale, subject, related, link, createdAt } })
+//                                       — ProactiveAgent `alert` output (Phase P11, plan 3.7;
+//                                          P11 contract section 4), only for a surfaced alert.
+//                                          PRIVATE like "agent-suggestion": emitted (reliable) only
+//                                          to the recipient's sockets. Goes through the per-user
+//                                          priority queue `nexus:{org_id}:queue:agent:{user_id}`
+//                                          (alertQueue.ts): most urgent first. An alert is only
+//                                          ever delivered into its own meeting's room: for a user
+//                                          not in that meeting it waits (24 h, at most 100 per
+//                                          user) and is drained when they join it. So the outer
+//                                          `meetingId` always equals `payload.meetingId`.
+//                                          Durable copy: GET /notifications?meeting_id=.
+//
 //   "agent-candidate" ({ meetingId, payload: { windowId, agent, kind, candidates } })
 //                                       — DecisionAgent `decision_candidate` / ActionAgent
 //                                          `action_candidate` output (Phase 8 Part A contract
@@ -134,6 +151,13 @@ import {
 //                                          depends_on } for actions). Proposals only: confirm and
 //                                          dismiss go through core-api. Not replayed: re-hydrate
 //                                          from GET /api/v1/meetings/:id/candidates.
+//
+// Backpressure shed order (plan 3.7 step 4; P11 contract section 4): before every "agent-delta"
+// emit the socket's outbound backlog is checked (engine.io packets waiting for the transport, plus
+// the WebSocket's unsent bytes). Over either threshold the delta is dropped and counted in
+// `mytheus_realtime_deltas_shed_total`. Nothing else is ever shed: captions, notes, candidates,
+// suggestions, context fills and alerts are reliable emits that queue behind the backlog. A
+// dropped delta costs only the typing effect; the final card carries the whole text.
 //
 // Disconnect: presence is removed from every meeting the socket had joined, "presence" is
 // re-broadcast per meeting, and a "leave" `presence-events` record is produced per meeting. This
@@ -205,6 +229,13 @@ export interface AppConfig {
   /** Consume `agent-stream`/`agent-results` and bridge them to sockets. On in production
    * (`AGENT_OUTPUT_ENABLED`, default on); off by default for in-process tests. */
   agentOutput?: boolean;
+  /** Kafka consumer group for the agent-output bridge. Default `realtime-gateway-agent-output`;
+   * overridable so a test pod never joins (and stalls) the shared production group. */
+  agentOutputGroupId?: string;
+  /** Shed an "agent-delta" when this many engine.io packets are already waiting. Default 64. */
+  deltaShedPackets?: number;
+  /** Shed an "agent-delta" when the WebSocket has this many unsent bytes. Default 256 KiB. */
+  deltaShedBytes?: number;
 }
 
 export interface AppDeps {
@@ -221,6 +252,9 @@ export interface App {
   httpServer: HttpServer;
   io: Server;
   nsp: Namespace;
+  /** Queue a routed "agent-alert" for its recipient and nudge the meeting channel (the consumer's
+   * `onAlert`). Exposed so tests can produce an alert "via this pod" without a broker. */
+  queueAlert(routed: RoutedAgentMessage): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -268,13 +302,33 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   captionSubClient.on("error", (err) => logger.error({ err }, "redis caption-sub client error"));
   io.adapter(createAdapter(pubClient, subClient, { key: "nexus" }));
 
+  const deltaShedPackets = config.deltaShedPackets ?? 64;
+  const deltaShedBytes = config.deltaShedBytes ?? 256 * 1024;
+
+  /**
+   * ProactiveAgent alerts never go straight onto the channel: they are queued for their
+   * recipient, then a content-free nudge tells every pod to drain if it holds that user's
+   * sockets in this meeting (alertQueue.ts). The queue key's org is the record header's internal
+   * UUID, the same value the channel embeds.
+   */
+  async function queueAlert(routed: RoutedAgentMessage): Promise<void> {
+    if (routed.message.type !== "agent-alert") return;
+    const orgId = extractOrgId(routed.channel);
+    if (orgId === null) return;
+    await enqueueAlert(pubClient, orgId, routed.message.userId, routed.message.payload);
+    const nudge: AlertQueuedNudge = { type: "agent-alert-queued", userId: routed.message.userId };
+    await pubClient.publish(routed.channel, JSON.stringify(nudge));
+  }
+
   const agentOutputConsumer =
     deps.agentOutputConsumer ??
     (config.agentOutput
       ? createAgentOutputConsumer({
           brokers: config.redpandaBrokers,
           schemaRegistryUrl: config.schemaRegistryUrl,
+          groupId: config.agentOutputGroupId,
           publisher: pubClient,
+          onAlert: queueAlert,
           logger,
         })
       : undefined);
@@ -342,11 +396,26 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       deliverAgentCandidate(channel, localSockets, msg as AgentPubsubMessage);
       return;
     }
+    if (msg.type === "agent-alert-queued") {
+      const userId = (msg as Partial<AlertQueuedNudge>).userId;
+      if (typeof userId !== "string" || userId.length === 0) return;
+      // Only a pod that actually holds this user's sockets on this channel drains, and only the
+      // alerts about this channel's meeting; the drain is atomic, so two such pods never deliver
+      // the same alert twice.
+      for (const socket of localSockets) {
+        if ((socket.data as SocketData).presenceUserId === userId) {
+          void drainAndPublish(channel, userId);
+          return;
+        }
+      }
+      return;
+    }
     if (
       msg.type === "agent-delta" ||
       msg.type === "agent-note" ||
       msg.type === "agent-suggestion" ||
-      msg.type === "agent-context"
+      msg.type === "agent-context" ||
+      msg.type === "agent-alert"
     ) {
       deliverAgentOutput(channel, localSockets, msg as AgentPubsubMessage);
       return;
@@ -386,11 +455,40 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     for (const socket of localSockets) {
       if ((socket.data as SocketData).presenceUserId !== msg.userId) continue;
       if (msg.type === "agent-delta") {
+        // Shed first: a delta over a backed-up socket is dropped, never queued behind it.
+        if (overBackpressure(socket, deltaShedPackets, deltaShedBytes)) {
+          deltasShed.inc();
+          continue;
+        }
         socket.volatile.emit("agent-delta", outbound);
       } else {
-        // a note, a suggestion or a context fill: private to its owner, a reliable emit
+        // a note, a suggestion, a context fill or an alert: private to its owner, a reliable
+        // emit that is never shed
         socket.emit(msg.type, outbound);
+        if (msg.type === "agent-alert") alertsDelivered.inc();
       }
+    }
+  }
+
+  /**
+   * Pops this user's queued alerts about `channel`'s meeting (and only those: an alert is never
+   * delivered into another meeting's room) and publishes them, most urgent first, on `channel`, so
+   * every pod (this one included) delivers it to that user's local sockets there. Publishing in
+   * order over one connection keeps the order: Redis delivers a connection's publishes in
+   * sequence.
+   */
+  async function drainAndPublish(channel: string, userId: string): Promise<void> {
+    const orgId = extractOrgId(channel);
+    const meetingId = extractMeetingId(channel);
+    if (orgId === null || meetingId === null) return;
+    try {
+      const alerts = await drainAlerts(pubClient, orgId, userId, meetingId);
+      for (const payload of alerts) {
+        const message: AgentPubsubMessage = { type: "agent-alert", userId, payload };
+        await pubClient.publish(channel, JSON.stringify(message));
+      }
+    } catch (err) {
+      logger.error({ err, orgId, userId }, "agent alert queue drain failed");
     }
   }
 
@@ -413,6 +511,11 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   function extractMeetingId(channel: string): string | null {
     const match = /^nexus:(.+):pubsub:meeting:(.+)$/.exec(channel);
     return match ? match[2] : null;
+  }
+
+  function extractOrgId(channel: string): string | null {
+    const match = /^nexus:(.+):pubsub:meeting:(.+)$/.exec(channel);
+    return match ? match[1] : null;
   }
 
   async function subscribeCaptionChannel(
@@ -488,6 +591,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       await socket.join(roomName(data.presenceOrgId, meetingId));
       data.joinedMeetings.add(meetingId);
       await subscribeCaptionChannel(data.presenceOrgId, meetingId, socket);
+      // Alerts about THIS meeting that waited for this user (not in the room when they were
+      // queued) are drained now, onto this meeting's channel, which this socket has just
+      // subscribed to. Alerts about other meetings stay queued for those meetings.
+      await drainAndPublish(pubsubChannel(data.presenceOrgId, meetingId), data.presenceUserId);
 
       await heartbeat(pubClient, data.presenceOrgId, meetingId, data.presenceUserId);
       // Keep this member's heartbeat fresh for as long as the socket stays joined to this
@@ -654,6 +761,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     httpServer,
     io,
     nsp,
+    queueAlert,
     async start() {
       await presenceEventsProducer.connect();
       await agentOutputConsumer?.start();
@@ -721,7 +829,27 @@ export function loadConfigFromEnv(): AppConfig {
     presenceStaleAfterMs: envInt("PRESENCE_STALE_AFTER_MS"),
     presenceSweepIntervalMs: envInt("PRESENCE_SWEEP_INTERVAL_MS"),
     agentOutput: process.env.AGENT_OUTPUT_ENABLED !== "0",
+    agentOutputGroupId: process.env.AGENT_OUTPUT_GROUP_ID || undefined,
+    deltaShedPackets: envInt("DELTA_SHED_PACKETS"),
+    deltaShedBytes: envInt("DELTA_SHED_BYTES"),
   };
+}
+
+/**
+ * True when this socket's outbound path is backed up: engine.io packets waiting for the
+ * transport to become writable, or bytes the WebSocket has accepted but not yet sent. Both are
+ * read defensively (the fields are engine.io / ws internals, typed loosely) so an unknown
+ * transport reads as "not backed up" rather than shedding everything.
+ */
+export function overBackpressure(socket: Socket, maxPackets: number, maxBytes: number): boolean {
+  const conn = socket.conn as unknown as {
+    writeBuffer?: unknown[];
+    transport?: { socket?: { bufferedAmount?: unknown } };
+  };
+  const packets = Array.isArray(conn.writeBuffer) ? conn.writeBuffer.length : 0;
+  const raw = conn.transport?.socket?.bufferedAmount;
+  const bytes = typeof raw === "number" ? raw : 0;
+  return packets >= maxPackets || bytes >= maxBytes;
 }
 
 function envInt(name: string): number | undefined {
