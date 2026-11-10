@@ -68,6 +68,33 @@ export interface PostChatParams {
   bearerToken: string;
 }
 
+export interface CoreReadParams {
+  meetingId: string;
+  bearerToken: string;
+}
+
+/** core-api's `CandidateState` (`GET /api/v1/meetings/:id/candidates/:candidate_id`). */
+export interface CandidateState {
+  id: string;
+  kind: "decision" | "action";
+  meeting_id: string;
+  status: string;
+  content: string;
+  rationale?: string | null;
+  assignee_id?: string | null;
+  due_date?: string | null;
+  confirmed_by?: string | null;
+}
+
+/** The fields of core-api's `MeetingDetail` this gateway reads to verify a host action. */
+export interface MeetingState {
+  id: string;
+  status: string;
+  host_user_id: string | null;
+  created_by: string | null;
+  agenda: Array<Record<string, unknown> & { id: string; status: string; status_source?: string }>;
+}
+
 export interface ParticipantCheckAllowed {
   allowed: true;
   /** `users.id` — core-api's internal UUID for the caller, resolved server-side from the Clerk
@@ -98,7 +125,15 @@ export interface CoreApiClient {
   isParticipant(params: IsParticipantParams): Promise<ParticipantCheckResult>;
   /** Durable chat write. Throws on a non-2xx response; the caller logs and moves on (the socket
    * emit already happened — this call only affects durability, not the live relay). */
-  postChat(params: PostChatParams): Promise<void>;
+  postChat(params: PostChatParams): Promise<{ id: string; createdAt: string } | null>;
+  /**
+   * One candidate of a meeting, read WITH THE ACTOR'S OWN TOKEN, so the gateway only ever tells
+   * the room what core-api actually stored (the shared candidate ledger). Null on any non-200,
+   * a malformed body or a network failure: an unverifiable claim is never broadcast.
+   */
+  getCandidate(params: CoreReadParams & { candidateId: string }): Promise<CandidateState | null>;
+  /** The meeting (status, host, creator, agenda), read with the actor's token. Null on failure. */
+  getMeeting(params: CoreReadParams): Promise<MeetingState | null>;
 }
 
 export interface CoreApiClientOptions {
@@ -147,6 +182,52 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
       }
     },
 
+    async getCandidate({ meetingId, candidateId, bearerToken }) {
+      try {
+        const res = await fetchFn(
+          `${options.baseUrl}/api/v1/meetings/${encodeURIComponent(meetingId)}/candidates/${encodeURIComponent(candidateId)}`,
+          { headers: { Authorization: `Bearer ${bearerToken}` } },
+        );
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as Partial<CandidateState>;
+        if (
+          typeof body.id !== "string" ||
+          (body.kind !== "decision" && body.kind !== "action") ||
+          typeof body.status !== "string" ||
+          typeof body.content !== "string" ||
+          body.meeting_id !== meetingId
+        ) {
+          return null;
+        }
+        return body as CandidateState;
+      } catch (err) {
+        options.logger?.warn({ err, meetingId, candidateId }, "core-api candidate read failed");
+        return null;
+      }
+    },
+
+    async getMeeting({ meetingId, bearerToken }) {
+      try {
+        const res = await fetchFn(
+          `${options.baseUrl}/api/v1/meetings/${encodeURIComponent(meetingId)}`,
+          { headers: { Authorization: `Bearer ${bearerToken}` } },
+        );
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as Partial<MeetingState>;
+        if (body.id !== meetingId || typeof body.status !== "string") return null;
+        return {
+          id: body.id,
+          status: body.status,
+          host_user_id: typeof body.host_user_id === "string" ? body.host_user_id : null,
+          created_by: typeof body.created_by === "string" ? body.created_by : null,
+          agenda: Array.isArray(body.agenda) ? body.agenda : [],
+        };
+      } catch (err) {
+        options.logger?.warn({ err, meetingId }, "core-api meeting read failed");
+        return null;
+      }
+    },
+
     async postChat({ meetingId, userId, content, clientMsgId, bearerToken }) {
       const res = await fetchFn(`${options.baseUrl}/api/v1/chat`, {
         method: "POST",
@@ -159,6 +240,16 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
       });
       if (!res.ok) {
         throw new Error(`core-api POST /api/v1/chat failed: ${res.status}`);
+      }
+      // The canonical row (`ChatMessage`): its id and time let every client dedupe the live relay
+      // against the history it re-reads on reconnect. A body without them is still a success.
+      try {
+        const row = (await res.json()) as { id?: unknown; created_at?: unknown };
+        return typeof row.id === "string" && typeof row.created_at === "string"
+          ? { id: row.id, createdAt: row.created_at }
+          : null;
+      } catch {
+        return null;
       }
     },
   };

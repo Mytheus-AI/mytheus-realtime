@@ -175,7 +175,7 @@ describe("realtime-gateway handshake + room join + presence + chat + captions", 
     const clientMsgId = `client-msg-${randomUUID()}`;
     sender.emit("chat", { meetingId, content: "hello room", clientMsgId });
 
-    await expect(received).resolves.toEqual({
+    await expect(received).resolves.toMatchObject({
       meetingId,
       userId: senderId,
       content: "hello room",

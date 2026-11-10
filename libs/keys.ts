@@ -100,3 +100,21 @@ export function roomName(orgId: string, meetingId: string): string {
 export function presenceIndexKey(): string {
   return "nexus:_internal:presence-index";
 }
+
+/**
+ * Who is editing which candidate card in a meeting right now (the shared candidate ledger's edit
+ * lock): one Redis hash per meeting, field = candidate id, value = JSON `{userId, socketId,
+ * until}`. Ephemeral by design (a lock expires on its own; the hash itself expires after a quiet
+ * six hours), so pod loss loses nothing durable.
+ */
+export function candidateLocksKey(orgId: string, meetingId: string): string {
+  return `nexus:${orgId}:candidate-locks:${meetingId}`;
+}
+
+/**
+ * Raised hands in a meeting: one Redis hash per meeting, field = internal user id, value = JSON
+ * `{socketId, at}`. Ephemeral like presence; read on join so a late joiner sees who is waiting.
+ */
+export function raisedHandsKey(orgId: string, meetingId: string): string {
+  return `nexus:${orgId}:hands:${meetingId}`;
+}
