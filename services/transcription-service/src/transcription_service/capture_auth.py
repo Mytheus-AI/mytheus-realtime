@@ -49,7 +49,8 @@ from typing import Any
 TOKEN_TYPE = "capture"
 ISSUER = "mytheus-ui"
 AUDIENCE = "transcription-service"
-SOURCES = frozenset({"meet", "teams", "zoom"})
+# `in_person`: a meeting recorded on the phone (core-api `POST /api/v1/capture/sessions`).
+SOURCES = frozenset({"meet", "teams", "zoom", "in_person"})
 MIN_SECRET_LENGTH = 32
 # The UI mints 15-minute tokens; anything claiming a longer life was not minted by it.
 MAX_TOKEN_LIFETIME_SECONDS = 60 * 60

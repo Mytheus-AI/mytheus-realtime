@@ -453,3 +453,19 @@ async def test_the_org_vocabulary_reaches_deepgram_for_a_captured_call() -> None
     query = parse_qs(urlparse(connect.call_args.args[0]).query)
     assert query["keyterm"] == ["Mytheus Brain", "Acme"]
     assert query["diarize"] == ["true"]
+
+
+def test_an_in_person_capture_from_the_phone_is_accepted() -> None:
+    """core-api mints `src: in_person` for a meeting recorded on the phone (wave 3)."""
+    script = [Utterance(str(uuid.uuid4()), "0", 0, 900, "Let's start with the budget.", True, 0.9)]
+    h = Harness(provider=FakeProvider(script=script, emit_on_audio=True))
+    with TestClient(h.app) as client:
+        with client.websocket_connect("/capture/audio") as ws:
+            ws.send_text(h.init("tab", token=h.token(src="in_person")))
+            assert _ready(ws)["channel"] == "tab"
+            ws.send_bytes(FRAME)
+            _wait_for(lambda: len(h.db.transcript_chunks) == 1)
+            ws.send_text(json.dumps({"type": "stop"}))
+            assert _expect_close(ws).code == audio_in.CLOSE_NORMAL
+    (consent,) = [a for a in h.db.audit_logs if a["action"] == "transcription.capture_consent"]
+    assert json.loads(consent["metadata"])["source"] == "in_person"
