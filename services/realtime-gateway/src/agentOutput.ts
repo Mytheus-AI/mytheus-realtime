@@ -80,6 +80,19 @@
  *         to the room.
  *   Anything else (other agents, other kinds, a header without a UUID tenant) is skipped.
  *
+ * The moment (polish program, Phase 1: cards tied to the moment, one card per moment). Each
+ * candidate item, suggestion item and surfaced note may carry where it came from: a UUID
+ * `moment_id` shared by every result of one moment, a `why` line (cut to 200), the verbatim
+ * `quote` (cut to 300), `speaker_id` (UUID) and `speaker_label` (cut to 80), and `start_ms` /
+ * `end_ms` on the meeting timeline; a candidate may also name `updates_candidate_id` (UUID: it
+ * re-emits an existing candidate's id with new content, so the room replaces that card in
+ * place). They are forwarded only when present and well formed, never as null, so a record from
+ * before them is forwarded exactly as before: snake_case inside candidate and suggestion items,
+ * camelCase on the note payload (`momentId`, `why`, `quote`, `speakerId`, `speakerLabel`,
+ * `startMs`, `endMs`). A note also forwards its `commitments` (ADR-0039 B6) as
+ * `[{ content, dueHint, momentId? }]` (at most five; private like the note), so the room can show
+ * a promise on the card of the moment it was made in.
+ *
  * Decoding: the consumer calls `registry.decode` with no reader schema, so each record is read
  * with the WRITER schema its registry id names. A symbol added to the `AgentClass` or
  * `AgentResultKind` enum (ADR-0038 D8: `MeetingAgent`, `meeting_update`) decodes
@@ -114,17 +127,62 @@ export interface AgentDeltaPayload {
   done: boolean;
 }
 
-export interface AgentNotePayload {
+/**
+ * Where an agent result came from in the meeting (polish program, Phase 1: "cards tied to the
+ * moment", "one card per moment"). Every field is optional and present only when the producer
+ * sent a well-formed value, so a record from before the moment fields existed is forwarded
+ * byte-for-byte as it was. snake_case inside candidate and suggestion items (their existing
+ * style), camelCase on a note payload (its existing style).
+ */
+export interface MomentFields {
+  /** One id shared by every result the agents produced from one moment (UUID). */
+  moment_id?: string;
+  /** "Why you're seeing this": one line, at most 200 chars. */
+  why?: string;
+  /** Candidates only: this result updates the existing candidate with this id (UUID). */
+  updates_candidate_id?: string;
+  /** The words that were said, verbatim, at most 300 chars. */
+  quote?: string;
+  /** The speaker's internal `users.id` (UUID), when known. */
+  speaker_id?: string;
+  /** The speaker's display name as the agent substituted it, at most 80 chars. */
+  speaker_label?: string;
+  /** The quoted turn on the meeting timeline (ms), the clock `transcript_chunks.start_ms` uses. */
+  start_ms?: number;
+  end_ms?: number;
+}
+
+/** A note's moment, camelCase like the rest of the note payload. */
+export interface NoteMomentFields {
+  momentId?: string;
+  why?: string;
+  quote?: string;
+  speakerId?: string;
+  speakerLabel?: string;
+  startMs?: number;
+  endMs?: number;
+}
+
+/** A promise the note's owner made in that window (ADR-0039 B6), private like the note. */
+export interface NoteCommitment {
+  content: string;
+  dueHint: string | null;
+  momentId?: string;
+}
+
+export interface AgentNotePayload extends NoteMomentFields {
   windowId: string;
   agent: string;
   content: string;
   confidence: number;
   relevanceScore: number;
   sourceChunkIds: string[];
+  /** Present only when the record carried well-formed commitments. */
+  commitments?: NoteCommitment[];
 }
 
 /** A surfaced decision candidate, fields as in the Phase 8 Part A contract section 1. */
-export interface DecisionCandidate {
+export interface DecisionCandidate extends MomentFields {
   id: string;
   content: string;
   confidence: number;
@@ -134,7 +192,7 @@ export interface DecisionCandidate {
 }
 
 /** A surfaced action candidate, fields as in the Phase 8 Part A contract section 1. */
-export interface ActionCandidate {
+export interface ActionCandidate extends MomentFields {
   id: string;
   content: string;
   confidence: number;
@@ -165,7 +223,7 @@ export interface SuggestionCitation {
 }
 
 /** A surfaced QuestionAgent suggestion (mytheus-docs ADR-0034 D3). */
-export interface QuestionSuggestion {
+export interface QuestionSuggestion extends MomentFields {
   id: string;
   question: string;
   priority: 1 | 2 | 3;
@@ -325,6 +383,88 @@ function strList(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 }
 
+const WHY_MAX = 200;
+const QUOTE_MAX = 300;
+const SPEAKER_LABEL_MAX = 80;
+const COMMITMENT_MAX = 300;
+const DUE_HINT_MAX = 80;
+const COMMITMENTS_MAX = 5;
+
+/** A trimmed, non-empty string cut to `max` chars, or null. */
+function text(v: unknown, max: number): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t ? t.slice(0, max) : null;
+}
+
+function uuid(v: unknown): string | null {
+  return typeof v === "string" && UUID_RE.test(v) ? v : null;
+}
+
+/** A whole, non-negative millisecond offset, or null. */
+function offsetMs(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : null;
+}
+
+/**
+ * The moment fields of one candidate or suggestion item, only those present and well formed
+ * (absent, not null, otherwise: an item from before these fields existed is unchanged).
+ */
+export function momentFields(c: Decoded, withUpdates: boolean): MomentFields {
+  const out: MomentFields = {};
+  const momentId = uuid(c.moment_id);
+  if (momentId) out.moment_id = momentId;
+  const why = text(c.why, WHY_MAX);
+  if (why) out.why = why;
+  if (withUpdates) {
+    const updates = uuid(c.updates_candidate_id);
+    if (updates) out.updates_candidate_id = updates;
+  }
+  const quote = text(c.quote, QUOTE_MAX);
+  if (quote) out.quote = quote;
+  const speakerId = uuid(c.speaker_id);
+  if (speakerId) out.speaker_id = speakerId;
+  const speakerLabel = text(c.speaker_label, SPEAKER_LABEL_MAX);
+  if (speakerLabel) out.speaker_label = speakerLabel;
+  const start = offsetMs(c.start_ms);
+  if (start !== null) out.start_ms = start;
+  const end = offsetMs(c.end_ms);
+  if (end !== null && (start === null || end >= start)) out.end_ms = end;
+  return out;
+}
+
+/** The same fields for a note, camelCase like the note payload. */
+function noteMoment(p: Decoded): NoteMomentFields {
+  const m = momentFields(p, false);
+  const out: NoteMomentFields = {};
+  if (m.moment_id) out.momentId = m.moment_id;
+  if (m.why) out.why = m.why;
+  if (m.quote) out.quote = m.quote;
+  if (m.speaker_id) out.speakerId = m.speaker_id;
+  if (m.speaker_label) out.speakerLabel = m.speaker_label;
+  if (m.start_ms !== undefined) out.startMs = m.start_ms;
+  if (m.end_ms !== undefined) out.endMs = m.end_ms;
+  return out;
+}
+
+/** A note's well-formed commitments (at most five), or null when there are none. */
+function noteCommitments(p: Decoded): NoteCommitment[] | null {
+  if (!Array.isArray(p.commitments)) return null;
+  const out: NoteCommitment[] = [];
+  for (const raw of p.commitments as unknown[]) {
+    if (raw === null || typeof raw !== "object") continue;
+    const c = raw as Decoded;
+    const content = text(c.content, COMMITMENT_MAX);
+    if (!content) continue;
+    const entry: NoteCommitment = { content, dueHint: text(c.due_hint, DUE_HINT_MAX) };
+    const momentId = uuid(c.moment_id);
+    if (momentId) entry.momentId = momentId;
+    out.push(entry);
+    if (out.length >= COMMITMENTS_MAX) break;
+  }
+  return out.length ? out : null;
+}
+
 function parsePayload(raw: unknown): Decoded | null {
   try {
     const parsed: unknown = JSON.parse(str(raw) ?? "{}");
@@ -363,6 +503,7 @@ function candidateRecord(windowId: string, value: Decoded): AgentCandidatePayloa
     content: c.content as string,
     confidence: typeof c.confidence === "number" ? c.confidence : 0,
     surfaced: true as const,
+    ...momentFields(c, true),
   });
   if (isDecision) {
     return {
@@ -433,6 +574,7 @@ function suggestionRecord(windowId: string, value: Decoded): AgentSuggestionPayl
       surfaced: true,
       rationale: str(s.rationale),
       citations: citations(s.citations),
+      ...momentFields(s, false),
     });
   }
   if (kept.length === 0) return null;
@@ -776,6 +918,7 @@ export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMess
     if (value.agent !== "PersonalListenerAgent" || value.kind !== "note") return null;
     const payload = parsePayload(value.payload_json);
     if (payload?.surfaced !== true) return null;
+    const commitments = noteCommitments(payload);
     return {
       channel,
       message: {
@@ -788,6 +931,8 @@ export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMess
           confidence: Number(value.confidence ?? 0),
           relevanceScore: Number(value.relevance_score ?? 0),
           sourceChunkIds: strList(value.source_chunk_ids),
+          ...noteMoment(payload),
+          ...(commitments ? { commitments } : {}),
         },
       },
     };
