@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from .captions import publish_caption
 from .db import tenant_transaction
 from .events import TranscriptChunk, build_envelope_header
+from .off_record import GATE
 from .outbox import enqueue
 from .providers.base import Utterance
 from .redaction import redact
@@ -129,7 +130,12 @@ async def process_utterance(
 ) -> FinalWriteResult | None:
     """The one call site. Returns `None` for every interim (by construction — the `if not
     is_final` branch never touches `session_factory` or the outbox at all) and for a
-    duplicate final; returns a `FinalWriteResult` only for a genuinely new final write."""
+    duplicate final; returns a `FinalWriteResult` only for a genuinely new final write.
+
+    Off the record (`off_record.py`): while the meeting's flag is set, every utterance, interim
+    or final, is dropped here before anything else: no caption, no row, no message."""
+    if redis is not None and await GATE.active(redis, org_id, meeting_id):
+        return None
     if not utterance.is_final:
         # Interim captions publish `utterance.text` RAW -- redaction never runs on this path
         # at all, not even computed. This is deliberate, decided on review (not an oversight

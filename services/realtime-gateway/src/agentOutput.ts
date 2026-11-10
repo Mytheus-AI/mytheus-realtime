@@ -356,7 +356,51 @@ export type AgentPubsubMessage =
   // Meeting-scoped: no userId, delivered to every local socket on the meeting channel.
   | { type: "agent-candidate"; payload: AgentCandidatePayload }
   // Meeting-scoped like candidates: the agenda is shared by the whole room (ADR-0038 D9).
-  | { type: "agent-agenda"; payload: AgentAgendaPayload };
+  | { type: "agent-agenda"; payload: AgentAgendaPayload }
+  // Live translation (polish wave 3): delivered only to the meeting's sockets that chose
+  // `payload.language` (privacy.ts).
+  | { type: "caption-translation"; payload: CaptionTranslationPayload };
+
+/**
+ * One live caption final in one language (agent-stream kind=caption_translation, mytheus-events
+ * 490fc46). `text` is set only when `status` is "translated"; "budget_denied" and "unavailable"
+ * are calm notices (the caption stays in its original language).
+ */
+export interface CaptionTranslationPayload {
+  chunkId: string;
+  language: string;
+  status: CaptionTranslationStatus;
+  text: string;
+}
+
+export type CaptionTranslationStatus = "translated" | "budget_denied" | "unavailable";
+const TRANSLATION_STATUSES: readonly string[] = ["translated", "budget_denied", "unavailable"];
+const LANGUAGE_RE = /^[a-z]{2}$/;
+/** A caption line is short; a translation longer than this is not a caption. */
+const MAX_TRANSLATION_CHARS = 4000;
+
+/**
+ * The caption translation one agent-stream record carries, or null when the record is not a
+ * well-formed `caption_translation` (an unknown status, a bad language, a non-uuid chunk, or a
+ * translated record with no text).
+ */
+export function captionTranslationRecord(value: Decoded): CaptionTranslationPayload | null {
+  if (value.kind !== "caption_translation") return null;
+  const chunkId = str(value.chunk_id);
+  const language = str(value.language);
+  const status = str(value.status);
+  const text = str(value.delta) ?? "";
+  if (!chunkId || !UUID_RE.test(chunkId)) return null;
+  if (!language || !LANGUAGE_RE.test(language)) return null;
+  if (!status || !TRANSLATION_STATUSES.includes(status)) return null;
+  if (status === "translated" && text.trim().length === 0) return null;
+  return {
+    chunkId,
+    language,
+    status: status as CaptionTranslationStatus,
+    text: status === "translated" ? text.slice(0, MAX_TRANSLATION_CHARS) : "",
+  };
+}
 
 /**
  * The cross-pod nudge "this user's priority queue has something": published on the meeting
@@ -885,6 +929,14 @@ export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMess
   const windowId = str(value.window_id) ?? "";
 
   if (topic === "agent-stream") {
+    // Live translation shares agent-stream (kind=caption_translation, user_id the nil UUID):
+    // never a token delta for a person. Anything else is routed as before, by topic.
+    if (value.kind === "caption_translation") {
+      const translation = captionTranslationRecord(value);
+      return translation
+        ? { channel, message: { type: "caption-translation", payload: translation } }
+        : null;
+    }
     return {
       channel,
       message: {
