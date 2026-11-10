@@ -152,11 +152,37 @@ import {
 //                                          dismiss go through core-api. Not replayed: re-hydrate
 //                                          from GET /api/v1/meetings/:id/candidates.
 //
+//   "agent-agenda" ({ meetingId, payload: { itemId, status, note } })
+//                                       — one entry of a MeetingAgent `meeting_update` record's
+//                                          `updates` (mytheus-docs ADR-0038 D7, D9), split out by
+//                                          agentOutput.ts: one event per well-formed entry of a
+//                                          surfaced record. MEETING-SCOPED like "agent-candidate":
+//                                          emitted (reliable) to EVERY socket of this pod joined
+//                                          to the meeting, because the agenda is shared.
+//                                          `status` is "in_progress" or "covered"; `note` is at
+//                                          most 300 chars and may be empty. A live hint only: core-api
+//                                          decides what is stored (a host-set status wins), so a
+//                                          client re-hydrates the agenda from
+//                                          GET /api/v1/meetings/:id, never from this socket.
+//
+//   "agent-nudge" ({ meetingId, payload: { id, type, itemId, content } })
+//                                       — the non-null `nudge` of a MeetingAgent `meeting_update`
+//                                          record (ADR-0038 D7, D9), only for a surfaced record and
+//                                          a well-formed nudge; at most one per record, published
+//                                          after that record's "agent-agenda" events. PRIVATE to
+//                                          the host: emitted (reliable) only to the sockets whose
+//                                          resolved internal user id is the record's `user_id`
+//                                          (the host's id), never to the room. `type` is
+//                                          "off_agenda", "over_time" or "unaddressed"; `itemId` is
+//                                          an agenda item id or null; `content` is 1 to 200 chars.
+//                                          Not persisted and not replayed: a missed nudge is gone.
+//
 // Backpressure shed order (plan 3.7 step 4; P11 contract section 4): before every "agent-delta"
 // emit the socket's outbound backlog is checked (engine.io packets waiting for the transport, plus
 // the WebSocket's unsent bytes). Over either threshold the delta is dropped and counted in
 // `mytheus_realtime_deltas_shed_total`. Nothing else is ever shed: captions, notes, candidates,
-// suggestions, context fills and alerts are reliable emits that queue behind the backlog. A
+// suggestions, context fills, alerts, agenda updates and nudges are reliable emits that queue
+// behind the backlog. A
 // dropped delta costs only the typing effect; the final card carries the whole text.
 //
 // Disconnect: presence is removed from every meeting the socket had joined, "presence" is
@@ -392,8 +418,8 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       logger.warn({ channel }, "discarding malformed message on caption channel");
       return;
     }
-    if (msg.type === "agent-candidate") {
-      deliverAgentCandidate(channel, localSockets, msg as AgentPubsubMessage);
+    if (msg.type === "agent-candidate" || msg.type === "agent-agenda") {
+      deliverMeetingScoped(channel, localSockets, msg as AgentPubsubMessage);
       return;
     }
     if (msg.type === "agent-alert-queued") {
@@ -415,7 +441,8 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       msg.type === "agent-note" ||
       msg.type === "agent-suggestion" ||
       msg.type === "agent-context" ||
-      msg.type === "agent-alert"
+      msg.type === "agent-alert" ||
+      msg.type === "agent-nudge"
     ) {
       deliverAgentOutput(channel, localSockets, msg as AgentPubsubMessage);
       return;
@@ -448,7 +475,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     localSockets: Set<Socket>,
     msg: AgentPubsubMessage,
   ): void {
-    if (msg.type === "agent-candidate") return;
+    if (msg.type === "agent-candidate" || msg.type === "agent-agenda") return;
     const meetingId = extractMeetingId(channel);
     if (meetingId === null || typeof msg.userId !== "string" || msg.userId.length === 0) return;
     const outbound = { meetingId, payload: msg.payload };
@@ -462,8 +489,8 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
         }
         socket.volatile.emit("agent-delta", outbound);
       } else {
-        // a note, a suggestion, a context fill or an alert: private to its owner, a reliable
-        // emit that is never shed
+        // a note, a suggestion, a context fill, an alert or a nudge: private to its owner (a
+        // nudge's owner is the meeting's host), a reliable emit that is never shed
         socket.emit(msg.type, outbound);
         if (msg.type === "agent-alert") alertsDelivered.inc();
       }
@@ -492,19 +519,19 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     }
   }
 
-  // Meeting-scoped candidates: every local socket on this (org-scoped) channel gets them. The
-  // channel, not the body, is the tenant fact, exactly as for captions above.
-  function deliverAgentCandidate(
+  // Meeting-scoped output (candidates, agenda updates): every local socket on this (org-scoped)
+  // channel gets it. The channel, not the body, is the tenant fact, exactly as for captions above.
+  function deliverMeetingScoped(
     channel: string,
     localSockets: Set<Socket>,
     msg: AgentPubsubMessage,
   ): void {
-    if (msg.type !== "agent-candidate") return;
+    if (msg.type !== "agent-candidate" && msg.type !== "agent-agenda") return;
     const meetingId = extractMeetingId(channel);
     if (meetingId === null) return;
     const outbound = { meetingId, payload: msg.payload };
     for (const socket of localSockets) {
-      socket.emit("agent-candidate", outbound);
+      socket.emit(msg.type, outbound);
     }
   }
 
