@@ -35,12 +35,21 @@
  *     record's `user_id`), delivered only to that user's sockets. A null fill, a silent fill,
  *     the `collaborations` log and the responder-side security entries are never forwarded
  *     (they are core-api's to persist and audit).
+ *   - `agent-results` `ProactiveAgent`/`alert` records (Phase P11, plan 3.6/3.7; P11 contract
+ *     sections 1 and 4) as "agent-alert", ONLY when `payload_json.alert` is surfaced and well
+ *     formed. PRIVATE like suggestions: tagged with the recipient's `userId` (the record's
+ *     `user_id`; ProactiveAgent emits one record per recipient). Unlike every other kind these are
+ *     NOT published straight to the channel: the consumer hands them to `onAlert`, which queues
+ *     them in the recipient's priority queue `nexus:{org_id}:queue:agent:{user_id}` and nudges
+ *     the meeting channel so a pod holding that user's sockets drains it (alertQueue.ts).
  *   Anything else (other agents, other kinds, a header without a UUID tenant) is skipped.
  *
  * Nothing is buffered or replayed: a client that reconnects re-hydrates notes from
  * `GET /api/v1/meetings/:id/worklogs?user_id=me` and candidates from
  * `GET /api/v1/meetings/:id/candidates`, suggestions from `GET /api/v1/suggestions?meeting_id=`,
- * context fills from `GET /api/v1/meetings/:id/context-fills`.
+ * context fills from `GET /api/v1/meetings/:id/context-fills`. Alerts are the one exception:
+ * an alert for a user with no socket stays queued (24 h) and is drained when they join; the
+ * durable copy is re-read from notification-service's `GET /notifications?meeting_id=`.
  */
 import { SchemaRegistry } from "@kafkajs/confluent-schema-registry";
 import { Kafka, type Consumer } from "kafkajs";
@@ -146,6 +155,45 @@ export interface AgentContextPayload {
   createdAt: string;
 }
 
+export type AlertType = "conflict" | "workload" | "dependency" | "missing_stakeholder";
+
+/** What an alert is about (P11 contract section 1). */
+export interface AlertSubject {
+  kind: "decision" | "action" | "meeting";
+  id: string;
+}
+
+/** Something an alert points at, rendered as a chip (P11 contract section 1). */
+export interface AlertRelated {
+  kind: "decision" | "action" | "user";
+  id: string;
+  label: string;
+}
+
+/**
+ * A surfaced ProactiveAgent alert, the socket event "agent-alert" (P11 contract section 4). This
+ * exact JSON is also the member stored in the recipient's priority queue, so a replayed record
+ * maps to the identical member and ZADD stays idempotent.
+ */
+export interface AgentAlertPayload {
+  id: string;
+  /** The meeting the alert's subject belongs to (may differ from the room it is delivered in). */
+  meetingId: string;
+  alertType: AlertType;
+  /** 1 = red (conflict), 2 = yellow (workload, dependency), 3 = blue (missing stakeholder). */
+  priority: 1 | 2 | 3;
+  title: string;
+  body: string;
+  confidence: number;
+  rationale: string | null;
+  subject: AlertSubject | null;
+  related: AlertRelated[];
+  /** A relative app path ("/decisions/{id}"); anything else is dropped to null. */
+  link: string | null;
+  /** ISO 8601, from the record header's `occurred_at`. */
+  createdAt: string;
+}
+
 export type AgentPubsubMessage =
   | { type: "agent-delta"; userId: string; payload: AgentDeltaPayload }
   | { type: "agent-note"; userId: string; payload: AgentNotePayload }
@@ -153,8 +201,21 @@ export type AgentPubsubMessage =
   | { type: "agent-suggestion"; userId: string; payload: AgentSuggestionPayload }
   // Private to the requester, like suggestions (P10 contract section 7).
   | { type: "agent-context"; userId: string; payload: AgentContextPayload }
+  // Private to the recipient (P11 contract section 4). Published only by a pod that drained the
+  // recipient's priority queue; every pod delivers it to that user's local sockets.
+  | { type: "agent-alert"; userId: string; payload: AgentAlertPayload }
   // Meeting-scoped: no userId, delivered to every local socket on the meeting channel.
   | { type: "agent-candidate"; payload: AgentCandidatePayload };
+
+/**
+ * The cross-pod nudge "this user's priority queue has something": published on the meeting
+ * channel after an enqueue. Carries no alert content; a pod holding the user's sockets on that
+ * channel drains the queue and publishes the popped alerts as "agent-alert" messages.
+ */
+export interface AlertQueuedNudge {
+  type: "agent-alert-queued";
+  userId: string;
+}
 
 export interface RoutedAgentMessage {
   channel: string;
@@ -338,6 +399,80 @@ function contextFillRecord(
   };
 }
 
+const ALERT_TYPES = new Set(["conflict", "workload", "dependency", "missing_stakeholder"]);
+const SUBJECT_KINDS = new Set(["decision", "action", "meeting"]);
+const RELATED_KINDS = new Set(["decision", "action", "user"]);
+const MAX_RELATED = 10;
+
+function alertSubject(raw: unknown): AlertSubject | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Decoded;
+  if (typeof r.kind !== "string" || !SUBJECT_KINDS.has(r.kind)) return null;
+  if (typeof r.id !== "string" || !UUID_RE.test(r.id)) return null;
+  return { kind: r.kind as AlertSubject["kind"], id: r.id };
+}
+
+function alertRelated(raw: unknown): AlertRelated[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AlertRelated[] = [];
+  for (const item of raw as unknown[]) {
+    if (item === null || typeof item !== "object") continue;
+    const r = item as Decoded;
+    if (typeof r.kind !== "string" || !RELATED_KINDS.has(r.kind)) continue;
+    if (typeof r.id !== "string" || !UUID_RE.test(r.id)) continue;
+    out.push({
+      kind: r.kind as AlertRelated["kind"],
+      id: r.id,
+      label: typeof r.label === "string" ? r.label.slice(0, 120) : "",
+    });
+    if (out.length >= MAX_RELATED) break;
+  }
+  return out;
+}
+
+/** Only a same-origin relative path ("/x"), never "//host" or a scheme, can reach a client href. */
+function relativeLink(raw: unknown): string | null {
+  if (typeof raw !== "string" || !raw.startsWith("/") || raw.startsWith("//")) return null;
+  if (raw.includes("\\") || /[\s<>"]/.test(raw)) return null;
+  return raw.slice(0, 300);
+}
+
+function alertRecord(meetingId: string, header: Decoded, value: Decoded): AgentAlertPayload | null {
+  if (value.agent !== "ProactiveAgent" || value.kind !== "alert") return null;
+  const alert = parsePayload(value.payload_json)?.alert;
+  if (alert === null || alert === undefined || typeof alert !== "object" || Array.isArray(alert)) {
+    return null;
+  }
+  const a = alert as Decoded;
+  const priority = a.priority;
+  if (
+    a.surfaced !== true ||
+    typeof a.id !== "string" ||
+    !UUID_RE.test(a.id) ||
+    typeof a.alert_type !== "string" ||
+    !ALERT_TYPES.has(a.alert_type) ||
+    (priority !== 1 && priority !== 2 && priority !== 3) ||
+    typeof a.title !== "string" ||
+    a.title.trim().length === 0
+  ) {
+    return null;
+  }
+  return {
+    id: a.id,
+    meetingId,
+    alertType: a.alert_type as AlertType,
+    priority,
+    title: a.title.trim().slice(0, 120),
+    body: typeof a.body === "string" ? a.body.slice(0, 400) : "",
+    confidence: typeof a.confidence === "number" ? a.confidence : 0,
+    rationale: str(a.rationale),
+    subject: alertSubject(a.subject),
+    related: alertRelated(a.related),
+    link: relativeLink(a.link),
+    createdAt: occurredAtIso(header),
+  };
+}
+
 /** Pure mapping from one decoded Avro value to the pub/sub message, or null to skip it. */
 export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMessage | null {
   const header = (value.header ?? {}) as Decoded;
@@ -371,6 +506,10 @@ export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMess
     const suggestion = suggestionRecord(windowId, value);
     if (suggestion) {
       return { channel, message: { type: "agent-suggestion", userId, payload: suggestion } };
+    }
+    if (value.agent === "ProactiveAgent") {
+      const alert = alertRecord(meetingId, header, value);
+      return alert ? { channel, message: { type: "agent-alert", userId, payload: alert } } : null;
     }
     if (value.agent === "ContextGapAgent") {
       const fill = contextFillRecord(meetingId, header, value);
@@ -411,7 +550,15 @@ export interface AgentOutputConsumer {
 export function createAgentOutputConsumer(params: {
   brokers: string[];
   schemaRegistryUrl: string;
+  /** Defaults to AGENT_OUTPUT_GROUP. */
+  groupId?: string;
   publisher: Publisher;
+  /**
+   * Receives every routed "agent-alert" instead of the publisher: alerts go through the
+   * recipient's priority queue (alertQueue.ts), never straight onto the channel. Without it an
+   * alert is skipped (logged), never published unqueued.
+   */
+  onAlert?: (routed: RoutedAgentMessage) => Promise<void>;
   logger: Logger;
 }): AgentOutputConsumer {
   const kafka = new Kafka({ clientId: "realtime-gateway", brokers: params.brokers });
@@ -420,7 +567,7 @@ export function createAgentOutputConsumer(params: {
 
   return {
     async start() {
-      consumer = kafka.consumer({ groupId: AGENT_OUTPUT_GROUP });
+      consumer = kafka.consumer({ groupId: params.groupId ?? AGENT_OUTPUT_GROUP });
       await consumer.connect();
       for (const topic of AGENT_TOPICS) {
         await consumer.subscribe({ topic, fromBeginning: false });
@@ -437,6 +584,11 @@ export function createAgentOutputConsumer(params: {
           }
           const routed = routeAgentRecord(topic, value);
           if (!routed) return;
+          if (routed.message.type === "agent-alert") {
+            if (params.onAlert) await params.onAlert(routed);
+            else params.logger.warn({ topic }, "agent alert skipped: no alert queue configured");
+            return;
+          }
           await params.publisher.publish(routed.channel, JSON.stringify(routed.message));
         },
       });

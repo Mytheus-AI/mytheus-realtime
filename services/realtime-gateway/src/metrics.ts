@@ -8,7 +8,7 @@
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { collectDefaultMetrics, Gauge, Registry } from "prom-client";
+import { collectDefaultMetrics, Counter, Gauge, Registry } from "prom-client";
 
 export const registry = new Registry();
 registry.setDefaultLabels({ service: "realtime-gateway" });
@@ -23,6 +23,20 @@ export const connectedSockets = new Gauge({
   collect() {
     this.set(clientCountSource());
   },
+});
+
+/** Backpressure shed order: an "agent-delta" dropped because its socket was backed up. */
+export const deltasShed = new Counter({
+  name: "mytheus_realtime_deltas_shed_total",
+  help: "agent-delta emits dropped because the socket's outbound buffer was over threshold.",
+  registers: [registry],
+});
+
+/** ProactiveAgent alerts emitted to a recipient socket (one per socket, so tabs count twice). */
+export const alertsDelivered = new Counter({
+  name: "mytheus_realtime_agent_alerts_delivered_total",
+  help: "agent-alert emits to recipient sockets on this pod.",
+  registers: [registry],
 });
 
 export function setClientCountSource(fn: () => number): void {

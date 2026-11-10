@@ -46,6 +46,17 @@ export function presenceKey(orgId: string, meetingId: string): string {
 }
 
 /**
+ * Verbatim canonical per-user agent priority queue: `nexus:{org_id}:queue:agent:{user_id}`
+ * (_canon/02-data-model.md section 5; plan 10-13 section 3.7 step 3). A Redis sorted set of the
+ * user's undelivered ProactiveAgent alerts, scored so ZPOPMIN yields the most urgent (priority 1,
+ * red) first and, within a priority, the oldest first. Ephemeral: the durable copy of every alert
+ * is notification-service's `notification_log`.
+ */
+export function agentQueueKey(orgId: string, userId: string): string {
+  return `nexus:${orgId}:queue:agent:${userId}`;
+}
+
+/**
  * Socket.io room name for a meeting, keyed by BOTH `org_id` and `meeting_id`.
  *
  * THIS IS A LOAD-BEARING TENANCY BOUNDARY, not defense in depth: `nsp.to(roomName(...))` is how
