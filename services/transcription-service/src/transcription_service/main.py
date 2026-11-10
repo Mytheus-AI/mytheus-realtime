@@ -17,9 +17,10 @@ Routes:
 
 On startup, launches `meeting_room_consumer.run_consumer` as a background task -- the
 `meeting-room-events` I/O loop whose `joined`/`left` hints open/close meeting sessions via
-`SessionTracker`. On shutdown: live audio connections are closed with 1001 and drained, the
-consumer is signalled to stop (not cancelled -- see the `finally` below), every open session
-is closed, then Redis and the engine are released.
+`SessionTracker` -- and `erasure_consumer.run_consumer`, the `admin-events` loop that erases a
+person's or a meeting's share of `transcript_chunks`. On shutdown: live audio connections are
+closed with 1001 and drained, the consumers are signalled to stop (not cancelled -- see the
+`finally` below), every open session is closed, then Redis and the engine are released.
 
 The consumer shares this process rather than running as its own deployment because
 `SessionTracker` keeps each meeting's open `TranscriptionStream` in memory and `/internal/audio`
@@ -55,6 +56,7 @@ from .capture_auth import secret_usable
 from .capture_in import CaptureHub, parse_allowed_origins
 from .config import load_settings_from_env
 from .db import make_engine, make_session_factory
+from .erasure_consumer import run_consumer as run_erasure_consumer
 from .meeting_room_consumer import run_consumer
 from .providers.factory import select_provider
 from .sessions import SessionTracker
@@ -83,6 +85,18 @@ def _log_consumer_exit(task: asyncio.Task[None]) -> None:
         logger.error(
             "meeting-room-events consumer exited unexpectedly; this pod is no longer opening "
             "or closing transcription sessions",
+            exc_info=exc,
+        )
+
+
+def _log_erasure_consumer_exit(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "admin-events erasure consumer exited unexpectedly; erasures will not reach "
+            "transcript_chunks until this pod restarts",
             exc_info=exc,
         )
 
@@ -134,6 +148,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     )
     consumer_task.add_done_callback(_log_consumer_exit)
+    # `admin-events` erasure_requested -> erase this service's `transcript_chunks` share
+    # (`erasure_consumer.py`). Its own task and consumer group; same stop flag.
+    erasure_task = asyncio.create_task(
+        run_erasure_consumer(
+            session_factory,
+            redis,
+            brokers=settings.redpanda_brokers,
+            schema_registry_url=settings.schema_registry_url,
+            stop=stop,
+        )
+    )
+    erasure_task.add_done_callback(_log_erasure_consumer_exit)
 
     async def _db_ready() -> bool:
         async with engine.connect() as conn:
@@ -172,6 +198,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             pass
         except Exception:  # noqa: BLE001 - shutdown must release Redis/the engine regardless
             logger.exception("meeting-room-events consumer raised during shutdown")
+        try:
+            await asyncio.wait_for(erasure_task, timeout=_CONSUMER_STOP_TIMEOUT_SECONDS)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+        except Exception:  # noqa: BLE001 - shutdown must release Redis/the engine regardless
+            logger.exception("admin-events erasure consumer raised during shutdown")
         await tracker.close_all()
         await redis.aclose()
         await engine.dispose()

@@ -107,7 +107,8 @@ import { createRoomEvents } from "./roomEvents";
 //
 //   "agent-delta" ({ meetingId, payload: { windowId, seq, delta, done } }) and
 //   "agent-note"  ({ meetingId, payload: { windowId, agent, content, confidence,
-//                   relevanceScore, sourceChunkIds } })
+//                   relevanceScore, sourceChunkIds, [momentId, why, quote, speakerId,
+//                   speakerLabel, startMs, endMs, commitments] } })
 //                                       — PersonalListenerAgent output (Plan 7-9 section 3.4,
 //                                          mytheus-docs ADR-0030 D5), bridged from `agent-stream`
 //                                          and `agent-results` by agentOutput.ts. PRIVATE: emitted
@@ -172,6 +173,11 @@ import { createRoomEvents } from "./roomEvents";
 //                                          depends_on } for actions). Proposals only: confirm and
 //                                          dismiss go through core-api. Not replayed: re-hydrate
 //                                          from GET /api/v1/meetings/:id/candidates.
+//                                          Each candidate (and each "agent-suggestion" item) may
+//                                          also carry its moment: moment_id, why,
+//                                          [updates_candidate_id], quote, speaker_id,
+//                                          speaker_label, start_ms, end_ms, only when present
+//                                          (agentOutput.ts momentFields).
 //
 //   "agent-agenda" ({ meetingId, payload: { itemId, status, note } })
 //                                       — one entry of a MeetingAgent `meeting_update` record's
