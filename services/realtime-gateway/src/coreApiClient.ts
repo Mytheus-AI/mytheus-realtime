@@ -93,6 +93,9 @@ export interface MeetingState {
   host_user_id: string | null;
   created_by: string | null;
   agenda: Array<Record<string, unknown> & { id: string; status: string; status_source?: string }>;
+  /** The host opened the 60-second wrap-up (polish program, close-out ritual); null when not. */
+  wrap_up_started_at: string | null;
+  wrap_up_by: string | null;
 }
 
 export interface ParticipantCheckAllowed {
@@ -132,7 +135,8 @@ export interface CoreApiClient {
    * a malformed body or a network failure: an unverifiable claim is never broadcast.
    */
   getCandidate(params: CoreReadParams & { candidateId: string }): Promise<CandidateState | null>;
-  /** The meeting (status, host, creator, agenda), read with the actor's token. Null on failure. */
+  /** The meeting (status, host, creator, agenda, wrap-up), read with the actor's token. Null on
+   * failure. */
   getMeeting(params: CoreReadParams): Promise<MeetingState | null>;
 }
 
@@ -221,6 +225,9 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
           host_user_id: typeof body.host_user_id === "string" ? body.host_user_id : null,
           created_by: typeof body.created_by === "string" ? body.created_by : null,
           agenda: Array.isArray(body.agenda) ? body.agenda : [],
+          wrap_up_started_at:
+            typeof body.wrap_up_started_at === "string" ? body.wrap_up_started_at : null,
+          wrap_up_by: typeof body.wrap_up_by === "string" ? body.wrap_up_by : null,
         };
       } catch (err) {
         options.logger?.warn({ err, meetingId }, "core-api meeting read failed");
