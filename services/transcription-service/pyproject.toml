@@ -12,6 +12,8 @@ dependencies = [
     "alembic>=1.13",
     "redis>=5.0",
     "pydantic>=2.7",
+    "grpcio>=1.63",
+    "protobuf>=5.26",
 ]
 
 [dependency-groups]

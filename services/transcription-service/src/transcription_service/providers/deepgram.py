@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError
 
 from ..compliance import assert_compliance_gate_green
+from ..org_context import OrgKeyterms, keyterm_params, keyterms_supported
 from ..residency import deepgram_endpoint_for_region
 from .base import (
     DEFAULT_ENCODING,
@@ -38,6 +40,8 @@ from .base import (
     TranscriptionStream,
     Utterance,
 )
+
+logger = logging.getLogger(__name__)
 
 # Deepgram's documented end-of-stream control message: flushes any pending final and then
 # closes the socket cleanly (1000), which ends `utterances()` without a drop.
@@ -152,10 +156,37 @@ class DeepgramProvider:
     `tests/test_deepgram_key_never_leaks.py`.
     """
 
-    def __init__(self, *, api_key: str, model: str = "nova-3", language: str = "multi") -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = "nova-3",
+        language: str = "multi",
+        keyterms: OrgKeyterms | None = None,
+    ) -> None:
         self._api_key = api_key
         self._model = model
         self._language = language
+        # ADR-0039 D1: the org's vocabulary as Deepgram `keyterm`s. None (no
+        # IDENTITY_GRPC_ADDR) or an unsupported model means streams open without them.
+        self._keyterms = keyterms
+        self._keyterms_unsupported_logged = False
+
+    async def _keyterms_for(self, org_id: str) -> list[str]:
+        if self._keyterms is None:
+            return []
+        if not keyterms_supported(self._model, self._language):
+            if not self._keyterms_unsupported_logged:
+                self._keyterms_unsupported_logged = True
+                logger.warning(
+                    "Deepgram keyterm is not supported for model=%s language=%s; "
+                    "streams open without company vocabulary",
+                    self._model,
+                    self._language,
+                )
+            return []
+        # Never raises: any failure is "no key terms" (org_context.py).
+        return await self._keyterms.for_org(org_id)
 
     async def open_stream(
         self,
@@ -193,7 +224,10 @@ class DeepgramProvider:
             "sample_rate": str(sample_rate),
             "channels": "1",
         }
-        url = f"{endpoint}?{urlencode(params)}"
+        # One `keyterm` per term (repeated parameter); spaces encode as "+", which Deepgram
+        # accepts for multi-word terms.
+        query = list(params.items()) + keyterm_params(await self._keyterms_for(org_id))
+        url = f"{endpoint}?{urlencode(query)}"
         ws = await websockets.connect(
             url, additional_headers={"Authorization": f"Token {self._api_key}"}
         )

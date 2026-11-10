@@ -4,7 +4,8 @@
 Env vars per the plan (3.6 step 12) plus this service's `.env.example`:
 `DEEPGRAM_API_KEY`, `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `REDIS_URL`,
 `REDPANDA_BROKERS`, `SCHEMA_REGISTRY_URL`, `TRANSCRIPTION_WS_BIND`, `DATABASE_URL`,
-`OTEL_EXPORTER_OTLP_ENDPOINT`.
+`OTEL_EXPORTER_OTLP_ENDPOINT`, `IDENTITY_GRPC_ADDR` (identity-tenant-service gRPC, for the
+org's Deepgram key terms; unset = none).
 
 `/internal/audio` (see `audio_in.py` for the contract): `INTERNAL_AUDIO_TOKEN` (shared secret
 the sender presents in `X-Internal-Auth`; unset means every connection is refused -- fail
@@ -53,6 +54,9 @@ class Settings:
     # are). Overridable without a release, e.g. DEEPGRAM_LANGUAGE=en for English-only.
     deepgram_model: str = "nova-3"
     deepgram_language: str = "multi"
+    # identity-tenant-service gRPC (ADR-0039 D1: GetOrgContext for Deepgram key terms). Same
+    # variable name as mytheus-intelligence. Unset means streams open without key terms.
+    identity_grpc_addr: str | None = None
 
     def __repr__(self) -> str:
         # Never print secrets (DB URL credentials, provider keys, the audio token).
@@ -71,6 +75,7 @@ def load_settings_from_env() -> Settings:
         deepgram_api_key=os.environ.get("DEEPGRAM_API_KEY") or None,
         deepgram_model=os.environ.get("DEEPGRAM_MODEL") or "nova-3",
         deepgram_language=os.environ.get("DEEPGRAM_LANGUAGE") or "multi",
+        identity_grpc_addr=os.environ.get("IDENTITY_GRPC_ADDR") or None,
         livekit_url=os.environ.get("LIVEKIT_URL") or None,
         livekit_api_key=os.environ.get("LIVEKIT_API_KEY") or None,
         livekit_api_secret=os.environ.get("LIVEKIT_API_SECRET") or None,
