@@ -65,6 +65,28 @@ export interface ResolvedIdentity {
   orgId?: string | null;
 }
 
+/** A candidate row the fake serves, keyed by `{meetingId}:{candidateId}`. */
+export interface FakeCandidate {
+  id: string;
+  kind: "decision" | "action";
+  meeting_id: string;
+  status: string;
+  content: string;
+  rationale?: string | null;
+  assignee_id?: string | null;
+  due_date?: string | null;
+  confirmed_by?: string | null;
+}
+
+/** The meeting fields the gateway reads. */
+export interface FakeMeeting {
+  id: string;
+  status: string;
+  host_user_id: string | null;
+  created_by: string | null;
+  agenda: Array<Record<string, unknown> & { id: string; status: string; status_source?: string }>;
+}
+
 export interface FakeCoreApi {
   baseUrl: string;
   /**
@@ -79,6 +101,12 @@ export interface FakeCoreApi {
     resolved?: ResolvedIdentity,
   ): void;
   chatCalls: RecordedChatCall[];
+  /** Serve this candidate row from `GET /api/v1/meetings/:m/candidates/:id`. */
+  setCandidate(row: FakeCandidate): void;
+  /** Serve this meeting from `GET /api/v1/meetings/:id`. */
+  setMeeting(row: FakeMeeting): void;
+  /** Make `POST /api/v1/chat` fail with this status (null = succeed). */
+  failChatWith: number | null;
   close(): Promise<void>;
 }
 
@@ -106,10 +134,28 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
     return resolved;
   }
 
+  const candidates = new Map<string, FakeCandidate>();
+  const meetings = new Map<string, FakeMeeting>();
+  const state = { failChatWith: null as number | null };
+
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? "", "http://localhost");
 
     if (req.method === "GET") {
+      const cand = /^\/api\/v1\/meetings\/([^/]+)\/candidates\/([^/]+)$/.exec(url.pathname);
+      if (cand) {
+        const row = candidates.get(`${cand[1]}:${cand[2]}`);
+        res.writeHead(row ? 200 : 404, { "content-type": "application/json" });
+        res.end(row ? JSON.stringify(row) : "{}");
+        return;
+      }
+      const meeting = /^\/api\/v1\/meetings\/([^/]+)$/.exec(url.pathname);
+      if (meeting) {
+        const row = meetings.get(meeting[1]);
+        res.writeHead(row ? 200 : 404, { "content-type": "application/json" });
+        res.end(row ? JSON.stringify(row) : "{}");
+        return;
+      }
       const match = /^\/api\/v1\/meetings\/([^/]+)\/participants\/([^/]+)$/.exec(url.pathname);
       if (match) {
         const [, meetingId, userId] = match;
@@ -137,6 +183,11 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
         body += chunk.toString("utf8");
       });
       req.on("end", () => {
+        if (state.failChatWith !== null) {
+          res.writeHead(state.failChatWith);
+          res.end();
+          return;
+        }
         const idempotencyKey = (req.headers["idempotency-key"] as string | undefined) ?? null;
         if (!idempotencyKey || !seenIdempotencyKeys.has(idempotencyKey)) {
           if (idempotencyKey) seenIdempotencyKeys.add(idempotencyKey);
@@ -153,8 +204,8 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
             idempotencyKey,
           });
         }
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ status: "ok" }));
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: randomUUID(), created_at: new Date().toISOString() }));
       });
       return;
     }
@@ -175,6 +226,18 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
       });
     },
     chatCalls,
+    setCandidate(row) {
+      candidates.set(`${row.meeting_id}:${row.id}`, row);
+    },
+    setMeeting(row) {
+      meetings.set(row.id, row);
+    },
+    get failChatWith() {
+      return state.failChatWith;
+    },
+    set failChatWith(v: number | null) {
+      state.failChatWith = v;
+    },
     async close() {
       await new Promise<void>((resolve, reject) =>
         server.close((err) => (err ? reject(err) : resolve())),

@@ -39,6 +39,7 @@ import {
   createPresenceEventsProducer,
   type PresenceEventsProducer,
 } from "./presenceEventsProducer";
+import { createRoomEvents } from "./roomEvents";
 
 // ---- Socket.io event contract (namespace `/v1`) ----------------------------------------------
 //
@@ -48,10 +49,18 @@ import {
 //     participant check; deny-by-default otherwise. Always resolves via `ack` (never throws to
 //     the client): { ok: true, presence: string[] } | { ok: false, error: "FORBIDDEN" |
 //     "INVALID_PAYLOAD" }. On success, also broadcasts "presence" to the room (see below).
-//   "chat" ({ meetingId: string, content: string, clientMsgId: string })
+//   "chat" ({ meetingId: string, content: string, clientMsgId: string }, ack?)
 //     Requires a prior successful "join" for that `meetingId` on this socket (else silently
-//     dropped). Broadcasts "chat" to the room immediately, then durably persists via `core-api`
-//     POST /api/v1/chat with `Idempotency-Key: clientMsgId`.
+//     dropped, ack `{ ok: false, error: "NOT_JOINED" }`). `content` is trimmed, 1 to 2000 chars.
+//     Broadcasts "chat" to the room immediately, then durably persists via `core-api`
+//     POST /api/v1/chat with `Idempotency-Key: clientMsgId`, then acks the sender
+//     `{ ok: true, persisted: boolean }` and, when stored, broadcasts "chat-saved".
+//   "reauth", "candidate-resolved", "candidate-lock", "agenda-status", "hand", "reaction",
+//   "end-meeting" — room-wide events a participant starts; see roomEvents.ts for the contract.
+//     The CLIENT'S AUTH: the handshake token is verified once, at connect (and on every
+//     reconnect, where the client's `auth` callback supplies a fresh one). "reauth" refreshes the
+//     token this socket presents to core-api afterwards, so chat persistence and the
+//     verification reads keep working past the Clerk session token's one-minute lifetime.
 //
 // Server -> client (broadcast to the room `meeting:{org_id}:{meeting_id}` — org-scoped, not
 // meeting-only; this is the actual tenancy boundary for cross-pod presence/chat fan-out, see
@@ -65,11 +74,14 @@ import {
 //                                       header comment. Matches ChatMessage.user_id's shape from
 //                                       core-api's POST /chat response, unlike the "chat" event
 //                                       below, which still carries the Clerk id (see its note).
-//   "chat" ({ meetingId, userId, content, clientMsgId }) — `userId` here is still the Clerk `sub`
-//                                       from the sender's JWT, not resolved to an internal UUID;
-//                                       out of scope for the presence-events fix this file's
-//                                       history refers to, flagged as a related follow-up rather
-//                                       than silently left inconsistent.
+//   "chat" ({ meetingId, userId, senderId, content, clientMsgId, sentAt }) — `userId` here is
+//                                       still the Clerk `sub` from the sender's JWT (kept for
+//                                       existing clients); `senderId` (added in the polish
+//                                       program) is the sender's internal `users.id`, the same id
+//                                       presence and chat history use. `sentAt` is ISO time.
+//   "chat-saved" ({ meetingId, payload: { clientMsgId, id, createdAt } }) — the message is now
+//                                       durable in core-api with this row id, so clients can
+//                                       merge it with the history they re-read on reconnect.
 //   "caption" ({ meetingId, payload })  — forwarded verbatim (Task 8) from `transcription-
 //                                          service`'s publish on the explicit pubsub channel.
 //                                          `payload` is `{ chunkId, speakerId, startMs, endMs,
@@ -223,6 +235,12 @@ export interface ChatPayload {
   clientMsgId: string;
 }
 
+export type ChatAck =
+  { ok: true; persisted: boolean } | { ok: false; error: "INVALID_PAYLOAD" | "NOT_JOINED" };
+
+/** Longest chat message the room relays and persists (core-api accepts up to 10,000). */
+export const CHAT_MAX_CHARS = 2000;
+
 interface SocketData {
   /** From the JWT `org_id` claim — Clerk's opaque org id, NOT a UUID. Used only for the trust
    * boundary (deny-by-default authz) and forwarded to core-api, which resolves it server-side.
@@ -374,6 +392,13 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       : undefined);
 
   const nsp = io.of("/v1");
+  const roomEvents = createRoomEvents({
+    nsp,
+    redis: pubClient,
+    coreApi: coreApiClient,
+    verifier: deps.jwtVerifier,
+    logger,
+  });
 
   // Handshake: org_id ONLY from the Clerk JWT, never from the client payload. Fail closed.
   nsp.use(async (socket, next) => {
@@ -672,15 +697,29 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
           "failed to produce presence-events (join)",
         );
       }
+
+      // Who is editing which card and whose hand is up, for this socket only (roomEvents.ts).
+      await roomEvents.sendRoomState(socket, meetingId);
     });
 
-    socket.on("chat", async (payload: ChatPayload) => {
+    roomEvents.attach(socket);
+
+    socket.on("chat", async (payload: ChatPayload, rawAck?: unknown) => {
+      const ack = typeof rawAck === "function" ? (rawAck as (res: ChatAck) => void) : undefined;
       const data = socket.data as SocketData;
       if (
         typeof payload?.meetingId !== "string" ||
         typeof payload?.content !== "string" ||
-        typeof payload?.clientMsgId !== "string"
+        typeof payload?.clientMsgId !== "string" ||
+        payload.clientMsgId.length === 0 ||
+        payload.clientMsgId.length > 100
       ) {
+        ack?.({ ok: false, error: "INVALID_PAYLOAD" });
+        return;
+      }
+      const content = payload.content.trim();
+      if (content.length === 0 || content.length > CHAT_MAX_CHARS) {
+        ack?.({ ok: false, error: "INVALID_PAYLOAD" });
         return;
       }
       if (!data.joinedMeetings.has(payload.meetingId)) {
@@ -688,6 +727,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
           { orgId, userId, meetingId: payload.meetingId },
           "chat dropped: socket has not joined this meeting",
         );
+        ack?.({ ok: false, error: "NOT_JOINED" });
         return;
       }
 
@@ -698,23 +738,34 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       nsp.to(roomName(data.presenceOrgId, payload.meetingId)).emit("chat", {
         meetingId: payload.meetingId,
         userId,
-        content: payload.content,
+        senderId: data.presenceUserId,
+        content,
         clientMsgId: payload.clientMsgId,
+        sentAt: new Date().toISOString(),
       });
 
       try {
-        await coreApiClient.postChat({
+        const saved = await coreApiClient.postChat({
           meetingId: payload.meetingId,
           userId,
-          content: payload.content,
+          content,
           clientMsgId: payload.clientMsgId,
           bearerToken: data.bearerToken,
         });
+        if (saved) {
+          nsp.to(roomName(data.presenceOrgId, payload.meetingId)).emit("chat-saved", {
+            meetingId: payload.meetingId,
+            payload: { clientMsgId: payload.clientMsgId, id: saved.id, createdAt: saved.createdAt },
+          });
+        }
+        ack?.({ ok: true, persisted: true });
       } catch (err) {
         logger.error(
           { err, orgId, meetingId: payload.meetingId },
           "core-api chat persistence call failed",
         );
+        // Everyone in the room saw it live; the sender learns it was not stored for late joiners.
+        ack?.({ ok: true, persisted: false });
       }
     });
 
@@ -769,6 +820,9 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
         "failed to produce presence-events (leave, from disconnect)",
       );
     }
+
+    // This socket's edit locks and raised hand go with it (roomEvents.ts; never throws).
+    await roomEvents.releaseOnDisconnect(data, socket.id, meetingId);
   }
 
   // Reconciliation sweep: reaps presence entries whose owning pod died without running its

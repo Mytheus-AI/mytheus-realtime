@@ -127,7 +127,7 @@ describe("cross-pod fan-out (canonical hard test — two separate processes)", (
     const clientMsgId = randomUUID();
     socketA.emit("chat", { meetingId, content: "hello from process A", clientMsgId });
 
-    await expect(chatOnB).resolves.toEqual({
+    await expect(chatOnB).resolves.toMatchObject({
       meetingId,
       userId: userA,
       content: "hello from process A",

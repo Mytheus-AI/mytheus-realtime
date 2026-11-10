@@ -54,3 +54,43 @@ async def record_session_decision(
             ),
         },
     )
+
+
+ACTION_CAPTURE_CONSENT = "transcription.capture_consent"
+
+
+async def record_capture_consent(
+    session: AsyncSession,
+    *,
+    org_id: str,
+    meeting_id: str,
+    user_id: str,
+    source: str,
+    channel: str,
+    consent_at: str,
+) -> None:
+    """The capture companion (`capture_in.py`): the person capturing a call held elsewhere
+    confirmed, in the extension, that they told the other participants it is being transcribed.
+    One append-only row per capture connection (mic and tab each), `actor_type='user'` because
+    the confirmation is that user's statement, recorded the moment their audio is accepted.
+    Same transaction rule as `record_session_decision`."""
+    await session.execute(
+        text(
+            "INSERT INTO audit_logs (org_id, actor_id, actor_type, action, target_type, "
+            "target_id, metadata) VALUES (:org_id, :actor_id, 'user', :action, 'meeting', "
+            ":meeting_id, CAST(:metadata AS jsonb))"
+        ),
+        {
+            "org_id": org_id,
+            "actor_id": user_id,
+            "action": ACTION_CAPTURE_CONSENT,
+            "meeting_id": meeting_id,
+            "metadata": json.dumps(
+                {
+                    "source": source,
+                    "channel": channel,
+                    "participants_told_at": consent_at,
+                }
+            ),
+        },
+    )
