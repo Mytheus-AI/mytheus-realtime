@@ -28,11 +28,19 @@
  *     the suggestions with `surfaced === true`, a UUID `id`, a string `question` and a priority
  *     of 1, 2 or 3 (none left: skipped). PRIVATE like notes (ADR-0034 D6): tagged with the
  *     owner's `userId`, delivered only to that user's sockets, never to the room.
+ *   - `agent-results` `ContextGapAgent`/`context_fill` records (Phase P10, plan 3.5) as
+ *     "agent-context", ONLY when `payload_json.fill` is an object with `surfaced === true`, a UUID
+ *     `id`, a non-empty string `content`, a known `hop` and a `responder` of "rag" or
+ *     "user:{uuid}". PRIVATE like suggestions: tagged with the requester's `userId` (the
+ *     record's `user_id`), delivered only to that user's sockets. A null fill, a silent fill,
+ *     the `collaborations` log and the responder-side security entries are never forwarded
+ *     (they are core-api's to persist and audit).
  *   Anything else (other agents, other kinds, a header without a UUID tenant) is skipped.
  *
  * Nothing is buffered or replayed: a client that reconnects re-hydrates notes from
  * `GET /api/v1/meetings/:id/worklogs?user_id=me` and candidates from
- * `GET /api/v1/meetings/:id/candidates`, suggestions from `GET /api/v1/suggestions?meeting_id=`.
+ * `GET /api/v1/meetings/:id/candidates`, suggestions from `GET /api/v1/suggestions?meeting_id=`,
+ * context fills from `GET /api/v1/meetings/:id/context-fills`.
  */
 import { SchemaRegistry } from "@kafkajs/confluent-schema-registry";
 import { Kafka, type Consumer } from "kafkajs";
@@ -120,11 +128,31 @@ export interface AgentSuggestionPayload {
   suggestions: QuestionSuggestion[];
 }
 
+/**
+ * A surfaced ContextGapAgent fill (P10 contract section 7). Only the fill travels; the gap and
+ * the collaboration log stay server-side.
+ */
+export interface AgentContextPayload {
+  id: string;
+  meetingId: string;
+  content: string;
+  confidence: number;
+  rationale: string | null;
+  hop: "peer" | "related_meeting" | "rag";
+  /** "user:{uuid}" for a peer or related-meeting agent, or "rag" for the requester's own KB. */
+  responder: string;
+  citations: SuggestionCitation[];
+  /** ISO 8601, from the record header's `occurred_at`. */
+  createdAt: string;
+}
+
 export type AgentPubsubMessage =
   | { type: "agent-delta"; userId: string; payload: AgentDeltaPayload }
   | { type: "agent-note"; userId: string; payload: AgentNotePayload }
   // Private to its owner, like notes (ADR-0034 D6).
   | { type: "agent-suggestion"; userId: string; payload: AgentSuggestionPayload }
+  // Private to the requester, like suggestions (P10 contract section 7).
+  | { type: "agent-context"; userId: string; payload: AgentContextPayload }
   // Meeting-scoped: no userId, delivered to every local socket on the meeting channel.
   | { type: "agent-candidate"; payload: AgentCandidatePayload };
 
@@ -257,6 +285,59 @@ function suggestionRecord(windowId: string, value: Decoded): AgentSuggestionPayl
   return { windowId, agent: "QuestionAgent", kind: "suggestion", suggestions: kept };
 }
 
+const HOPS = new Set(["peer", "related_meeting", "rag"]);
+const RESPONDER_RE = /^(rag|user:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/**
+ * `occurred_at` is timestamp-micros, decoded as a number (or bigint). A value too small to be
+ * micros in this century is read as milliseconds (some test producers send `Date.now()`).
+ * Anything unusable falls back to now.
+ */
+function occurredAtIso(header: Decoded): string {
+  const raw = header.occurred_at;
+  const n = typeof raw === "bigint" ? Number(raw) : typeof raw === "number" ? raw : NaN;
+  const ms = n >= 1e14 ? n / 1000 : n;
+  const date = Number.isFinite(ms) && ms > 0 ? new Date(ms) : new Date();
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
+function contextFillRecord(
+  meetingId: string,
+  header: Decoded,
+  value: Decoded,
+): AgentContextPayload | null {
+  if (value.agent !== "ContextGapAgent" || value.kind !== "context_fill") return null;
+  const fill = parsePayload(value.payload_json)?.fill;
+  if (fill === null || fill === undefined || typeof fill !== "object" || Array.isArray(fill)) {
+    return null;
+  }
+  const f = fill as Decoded;
+  if (
+    f.surfaced !== true ||
+    typeof f.id !== "string" ||
+    !UUID_RE.test(f.id) ||
+    typeof f.content !== "string" ||
+    f.content.length === 0 ||
+    typeof f.hop !== "string" ||
+    !HOPS.has(f.hop) ||
+    typeof f.responder !== "string" ||
+    !RESPONDER_RE.test(f.responder)
+  ) {
+    return null;
+  }
+  return {
+    id: f.id,
+    meetingId,
+    content: f.content,
+    confidence: typeof f.confidence === "number" ? f.confidence : 0,
+    rationale: str(f.rationale),
+    hop: f.hop as AgentContextPayload["hop"],
+    responder: f.responder,
+    citations: citations(f.citations),
+    createdAt: occurredAtIso(header),
+  };
+}
+
 /** Pure mapping from one decoded Avro value to the pub/sub message, or null to skip it. */
 export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMessage | null {
   const header = (value.header ?? {}) as Decoded;
@@ -290,6 +371,10 @@ export function routeAgentRecord(topic: string, value: Decoded): RoutedAgentMess
     const suggestion = suggestionRecord(windowId, value);
     if (suggestion) {
       return { channel, message: { type: "agent-suggestion", userId, payload: suggestion } };
+    }
+    if (value.agent === "ContextGapAgent") {
+      const fill = contextFillRecord(meetingId, header, value);
+      return fill ? { channel, message: { type: "agent-context", userId, payload: fill } } : null;
     }
     if (value.agent !== "PersonalListenerAgent" || value.kind !== "note") return null;
     const payload = parsePayload(value.payload_json);

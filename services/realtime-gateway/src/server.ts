@@ -110,6 +110,15 @@ import {
 //                                          Not replayed: re-hydrate from core-api's
 //                                          GET /api/v1/suggestions?meeting_id=.
 //
+//   "agent-context" ({ meetingId, payload: { id, meetingId, content, confidence, rationale,
+//                   hop, responder, citations, createdAt } })
+//                                       — ContextGapAgent `context_fill` output (Phase P10,
+//                                          plan 3.5), bridged from `agent-results` by
+//                                          agentOutput.ts, only for a surfaced fill. PRIVATE like
+//                                          "agent-suggestion": emitted only to the requester's
+//                                          sockets, never to the room. Not replayed: re-hydrate
+//                                          from GET /api/v1/meetings/:id/context-fills.
+//
 //   "agent-candidate" ({ meetingId, payload: { windowId, agent, kind, candidates } })
 //                                       — DecisionAgent `decision_candidate` / ActionAgent
 //                                          `action_candidate` output (Phase 8 Part A contract
@@ -336,7 +345,8 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     if (
       msg.type === "agent-delta" ||
       msg.type === "agent-note" ||
-      msg.type === "agent-suggestion"
+      msg.type === "agent-suggestion" ||
+      msg.type === "agent-context"
     ) {
       deliverAgentOutput(channel, localSockets, msg as AgentPubsubMessage);
       return;
@@ -378,7 +388,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       if (msg.type === "agent-delta") {
         socket.volatile.emit("agent-delta", outbound);
       } else {
-        // a note or a suggestion: private to its owner, a reliable emit
+        // a note, a suggestion or a context fill: private to its owner, a reliable emit
         socket.emit(msg.type, outbound);
       }
     }
