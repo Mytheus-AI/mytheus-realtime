@@ -48,7 +48,8 @@
  * `GET /api/v1/meetings/:id/worklogs?user_id=me` and candidates from
  * `GET /api/v1/meetings/:id/candidates`, suggestions from `GET /api/v1/suggestions?meeting_id=`,
  * context fills from `GET /api/v1/meetings/:id/context-fills`. Alerts are the one exception:
- * an alert for a user with no socket stays queued (24 h) and is drained when they join; the
+ * an alert for a user not in its meeting stays queued (24 h) and is drained when they join that
+ * meeting; the
  * durable copy is re-read from notification-service's `GET /notifications?meeting_id=`.
  */
 import { SchemaRegistry } from "@kafkajs/confluent-schema-registry";
@@ -177,7 +178,7 @@ export interface AlertRelated {
  */
 export interface AgentAlertPayload {
   id: string;
-  /** The meeting the alert's subject belongs to (may differ from the room it is delivered in). */
+  /** The meeting the alert's subject belongs to; it is only ever delivered into that room. */
   meetingId: string;
   alertType: AlertType;
   /** 1 = red (conflict), 2 = yellow (workload, dependency), 3 = blue (missing stakeholder). */

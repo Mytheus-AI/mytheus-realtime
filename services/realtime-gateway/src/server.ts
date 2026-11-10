@@ -129,11 +129,11 @@ import {
 //                                          PRIVATE like "agent-suggestion": emitted (reliable) only
 //                                          to the recipient's sockets. Goes through the per-user
 //                                          priority queue `nexus:{org_id}:queue:agent:{user_id}`
-//                                          (alertQueue.ts): most urgent first, and an alert for a
-//                                          user with no socket waits there (24 h) and is drained
-//                                          to them when they join any meeting room. The outer
-//                                          `meetingId` is the room it is delivered in;
-//                                          `payload.meetingId` is the meeting the alert is about.
+//                                          (alertQueue.ts): most urgent first. An alert is only
+//                                          ever delivered into its own meeting's room: for a user
+//                                          not in that meeting it waits (24 h, at most 100 per
+//                                          user) and is drained when they join it. So the outer
+//                                          `meetingId` always equals `payload.meetingId`.
 //                                          Durable copy: GET /notifications?meeting_id=.
 //
 //   "agent-candidate" ({ meetingId, payload: { windowId, agent, kind, candidates } })
@@ -399,8 +399,9 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     if (msg.type === "agent-alert-queued") {
       const userId = (msg as Partial<AlertQueuedNudge>).userId;
       if (typeof userId !== "string" || userId.length === 0) return;
-      // Only a pod that actually holds this user's sockets on this channel drains; ZPOPMIN is
-      // atomic, so two such pods never deliver the same alert twice.
+      // Only a pod that actually holds this user's sockets on this channel drains, and only the
+      // alerts about this channel's meeting; the drain is atomic, so two such pods never deliver
+      // the same alert twice.
       for (const socket of localSockets) {
         if ((socket.data as SocketData).presenceUserId === userId) {
           void drainAndPublish(channel, userId);
@@ -470,16 +471,18 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   }
 
   /**
-   * Pops everything queued for this user and publishes it, most urgent first, on `channel`, so
+   * Pops this user's queued alerts about `channel`'s meeting (and only those: an alert is never
+   * delivered into another meeting's room) and publishes them, most urgent first, on `channel`, so
    * every pod (this one included) delivers it to that user's local sockets there. Publishing in
    * order over one connection keeps the order: Redis delivers a connection's publishes in
    * sequence.
    */
   async function drainAndPublish(channel: string, userId: string): Promise<void> {
     const orgId = extractOrgId(channel);
-    if (orgId === null) return;
+    const meetingId = extractMeetingId(channel);
+    if (orgId === null || meetingId === null) return;
     try {
-      const alerts = await drainAlerts(pubClient, orgId, userId);
+      const alerts = await drainAlerts(pubClient, orgId, userId, meetingId);
       for (const payload of alerts) {
         const message: AgentPubsubMessage = { type: "agent-alert", userId, payload };
         await pubClient.publish(channel, JSON.stringify(message));
@@ -588,8 +591,9 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       await socket.join(roomName(data.presenceOrgId, meetingId));
       data.joinedMeetings.add(meetingId);
       await subscribeCaptionChannel(data.presenceOrgId, meetingId, socket);
-      // Alerts that waited for this user (no socket when they were queued) are drained now, onto
-      // this meeting's channel, which this socket has just subscribed to.
+      // Alerts about THIS meeting that waited for this user (not in the room when they were
+      // queued) are drained now, onto this meeting's channel, which this socket has just
+      // subscribed to. Alerts about other meetings stay queued for those meetings.
       await drainAndPublish(pubsubChannel(data.presenceOrgId, meetingId), data.presenceUserId);
 
       await heartbeat(pubClient, data.presenceOrgId, meetingId, data.presenceUserId);

@@ -25,7 +25,14 @@ import type { Socket as ClientSocket } from "socket.io-client";
 
 import { agentQueueKey, pubsubChannel } from "../../../libs/keys";
 import { routeAgentRecord, type AgentAlertPayload } from "../src/agentOutput";
-import { ALERT_QUEUE_TTL_SECONDS, alertScore, drainAlerts, enqueueAlert } from "../src/alertQueue";
+import {
+  ALERT_MAX_AGE_MS,
+  ALERT_QUEUE_CAP,
+  ALERT_QUEUE_TTL_SECONDS,
+  alertScore,
+  drainAlerts,
+  enqueueAlert,
+} from "../src/alertQueue";
 import { registry } from "../src/metrics";
 import type { JoinAck } from "../src/server";
 import { connectClient, startTestApp, type TestApp } from "./helpers/testApp";
@@ -197,6 +204,9 @@ describe("the per-user priority queue (real Redis)", () => {
     expect(Number.isSafeInteger(alertScore(3, t))).toBe(true);
   });
 
+  // The clock the queue sees in these tests, so fixed fixture times never age past 24 h.
+  const NOW = Date.parse("2026-11-10T12:00:00.000Z");
+
   it("pops a priority-1 queued after two priority-3 first, keeps a 24 h TTL, and is idempotent on replay", async () => {
     const org = randomUUID();
     const user = randomUUID();
@@ -204,10 +214,10 @@ describe("the per-user priority queue (real Redis)", () => {
     const noteA = payload(meeting, 3, "2026-11-10T10:00:00.000Z", "note A");
     const noteB = payload(meeting, 3, "2026-11-10T10:00:01.000Z", "note B");
     const conflict = payload(meeting, 1, "2026-11-10T10:00:02.000Z", "conflict");
-    await enqueueAlert(redis, org, user, noteA);
-    await enqueueAlert(redis, org, user, noteB);
-    await enqueueAlert(redis, org, user, conflict);
-    await enqueueAlert(redis, org, user, conflict); // a replayed record
+    await enqueueAlert(redis, org, user, noteA, NOW);
+    await enqueueAlert(redis, org, user, noteB, NOW);
+    await enqueueAlert(redis, org, user, conflict, NOW);
+    await enqueueAlert(redis, org, user, conflict, NOW); // a replayed record
 
     const key = agentQueueKey(org, user);
     expect(key).toBe(`nexus:${org}:queue:agent:${user}`);
@@ -216,10 +226,99 @@ describe("the per-user priority queue (real Redis)", () => {
     expect(ttl).toBeGreaterThan(ALERT_QUEUE_TTL_SECONDS - 10);
     expect(ttl).toBeLessThanOrEqual(ALERT_QUEUE_TTL_SECONDS);
 
-    const drained = await drainAlerts(redis, org, user);
+    const drained = await drainAlerts(redis, org, user, meeting, NOW);
     expect(drained.map((a) => a.title)).toEqual(["conflict", "note A", "note B"]);
     expect(await redis.exists(key)).toBe(0);
-    expect(await drainAlerts(redis, org, user)).toEqual([]);
+    expect(await drainAlerts(redis, org, user, meeting, NOW)).toEqual([]);
+  });
+
+  it("drains only the alerts about the given meeting; the rest stay queued in order", async () => {
+    const org = randomUUID();
+    const user = randomUUID();
+    const x = randomUUID();
+    const y = randomUUID();
+    await enqueueAlert(
+      redis,
+      org,
+      user,
+      payload(y, 1, "2026-11-10T10:00:00.000Z", "Y conflict"),
+      NOW,
+    );
+    await enqueueAlert(redis, org, user, payload(x, 3, "2026-11-10T10:00:01.000Z", "X note"), NOW);
+    await enqueueAlert(
+      redis,
+      org,
+      user,
+      payload(y, 2, "2026-11-10T10:00:02.000Z", "Y workload"),
+      NOW,
+    );
+    await enqueueAlert(
+      redis,
+      org,
+      user,
+      payload(x, 2, "2026-11-10T10:00:03.000Z", "X workload"),
+      NOW,
+    );
+
+    const inX = await drainAlerts(redis, org, user, x, NOW);
+    expect(inX.map((a) => a.title)).toEqual(["X workload", "X note"]);
+    expect(await redis.zcard(agentQueueKey(org, user))).toBe(2);
+    const inY = await drainAlerts(redis, org, user, y, NOW);
+    expect(inY.map((a) => a.title)).toEqual(["Y conflict", "Y workload"]);
+    expect(await redis.exists(agentQueueKey(org, user))).toBe(0);
+  });
+
+  it("drops alerts older than 24 h on enqueue and never drains one", async () => {
+    const org = randomUUID();
+    const user = randomUUID();
+    const meeting = randomUUID();
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const stale = payload(meeting, 1, iso(NOW - ALERT_MAX_AGE_MS - 60_000), "stale conflict");
+    const fresh = payload(meeting, 3, iso(NOW - 60_000), "fresh note");
+    await enqueueAlert(redis, org, user, stale, NOW - ALERT_MAX_AGE_MS - 120_000); // fresh when queued
+    expect(await redis.zcard(agentQueueKey(org, user))).toBe(1);
+    // a day later, the next enqueue purges it
+    await enqueueAlert(redis, org, user, fresh, NOW);
+    expect(await redis.zcard(agentQueueKey(org, user))).toBe(1);
+    expect((await drainAlerts(redis, org, user, meeting, NOW)).map((a) => a.title)).toEqual([
+      "fresh note",
+    ]);
+
+    // and the drain itself never delivers an expired member that is still stored
+    await enqueueAlert(redis, org, user, payload(meeting, 2, iso(NOW), "ages out"), NOW);
+    expect(await drainAlerts(redis, org, user, meeting, NOW + ALERT_MAX_AGE_MS + 1)).toEqual([]);
+    expect(await redis.exists(agentQueueKey(org, user))).toBe(0);
+  });
+
+  it("caps the queue at 100: the least urgent go first, a red conflict is never dropped for notes", async () => {
+    const org = randomUUID();
+    const user = randomUUID();
+    const meeting = randomUUID();
+    const key = agentQueueKey(org, user);
+    const base = NOW - 3_600_000;
+    for (let i = 0; i < ALERT_QUEUE_CAP + 20; i++) {
+      await enqueueAlert(
+        redis,
+        org,
+        user,
+        payload(meeting, 3, new Date(base + i * 1000).toISOString(), `note ${i}`),
+        NOW,
+      );
+    }
+    expect(await redis.zcard(key)).toBe(ALERT_QUEUE_CAP);
+    await enqueueAlert(
+      redis,
+      org,
+      user,
+      payload(meeting, 1, new Date(NOW).toISOString(), "conflict"),
+      NOW,
+    );
+    expect(await redis.zcard(key)).toBe(ALERT_QUEUE_CAP);
+    const drained = await drainAlerts(redis, org, user, meeting, NOW);
+    expect(drained).toHaveLength(ALERT_QUEUE_CAP);
+    expect(drained[0].title).toBe("conflict");
+    expect(drained[1].title).toBe("note 0");
+    expect(drained[drained.length - 1].title).toBe(`note ${ALERT_QUEUE_CAP - 2}`);
   });
 });
 
@@ -275,10 +374,10 @@ describe("alert delivery (real Redis, real Socket.io)", () => {
     userId: string,
     overrides: Record<string, unknown> = {},
   ) {
-    const routed = routeAgentRecord(
-      "agent-results",
-      alertRecord(orgId, meetingId, userId, rawAlert(overrides)),
-    );
+    const record = alertRecord(orgId, meetingId, userId, rawAlert(overrides));
+    // a current timestamp, so the queue's 24 h cutoff never ages the fixture out
+    record.header.occurred_at = Date.now() * 1000;
+    const routed = routeAgentRecord("agent-results", record);
     expect(routed?.message.type).toBe("agent-alert");
     return routed!;
   }
@@ -355,6 +454,45 @@ describe("alert delivery (real Redis, real Socket.io)", () => {
     await waitFor(() => titles.length >= 3);
     expect(titles).toEqual(["conflict", "note A", "note B"]);
     expect(await publisher.exists(agentQueueKey(org, carol))).toBe(0);
+  });
+
+  it("never delivers an alert into another meeting's room: an alert about Y waits while the user is in X", async () => {
+    const x = randomUUID();
+    const y = randomUUID();
+    const org = randomUUID();
+    const frank = randomUUID();
+    const clerkOrg = `org-${randomUUID()}`;
+    const inX: unknown[] = [];
+    await join(t, clerkOrg, x, org, frank, (s) => s.on("agent-alert", (e) => inX.push(e)));
+
+    const aboutY = routedFor(org, y, frank, { title: "About Y" });
+    await t.app.queueAlert(aboutY); // nudges Y's channel, where frank has no socket
+    const aboutX = routedFor(org, x, frank, {
+      priority: 3,
+      alert_type: "missing_stakeholder",
+      title: "About X",
+    });
+    await t.app.queueAlert(aboutX); // nudges X's channel: drains X's alerts only
+
+    await waitFor(() => inX.length >= 1);
+    await sleep(300);
+    expect(inX).toEqual([{ meetingId: x, payload: aboutX.message.payload }]);
+    expect(await publisher.zcard(agentQueueKey(org, frank))).toBe(1); // Y's alert still waits
+
+    // joining X again (a reconnect) still does not pull Y's alert in
+    const again: unknown[] = [];
+    await join(t, clerkOrg, x, org, frank, (s) => s.on("agent-alert", (e) => again.push(e)));
+    await sleep(300);
+    expect(again).toEqual([]);
+
+    // joining Y delivers it, into Y's room
+    const inY: { meetingId: string; payload: AgentAlertPayload }[] = [];
+    await join(t, clerkOrg, y, org, frank, (s) =>
+      s.on("agent-alert", (e: (typeof inY)[number]) => inY.push(e)),
+    );
+    await waitFor(() => inY.length >= 1);
+    expect(inY).toEqual([{ meetingId: y, payload: aboutY.message.payload }]);
+    expect(await publisher.exists(agentQueueKey(org, frank))).toBe(0);
   });
 
   it("crosses instances: produced via instance 1, delivered to a socket on instance 2 (hop measured)", async () => {
