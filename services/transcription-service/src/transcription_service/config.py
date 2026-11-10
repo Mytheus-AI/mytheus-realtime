@@ -10,7 +10,8 @@ org's Deepgram key terms; unset = none).
 `/internal/audio` (see `audio_in.py` for the contract): `INTERNAL_AUDIO_TOKEN` (shared secret
 the sender presents in `X-Internal-Auth`; unset means every connection is refused -- fail
 closed), `AUDIO_INIT_TIMEOUT_SECONDS`, `AUDIO_IDLE_TIMEOUT_SECONDS`, `AUDIO_MAX_FRAME_BYTES`,
-`AUDIO_QUEUE_MAX_FRAMES`. `TRANSCRIPTION_ALLOW_FAKE_PROVIDER=1` (default off) is the explicit
+`AUDIO_QUEUE_MAX_FRAMES`. `/capture/audio` (`capture_in.py`): `CAPTURE_TOKEN_SECRET`,
+`CAPTURE_ALLOWED_ORIGINS`. `TRANSCRIPTION_ALLOW_FAKE_PROVIDER=1` (default off) is the explicit
 dev opt-in that lets `FakeProvider` be selected when no `DEEPGRAM_API_KEY` is set; without it
 the service fails closed (`providers/factory.py`). The new fields carry defaults so existing
 direct `Settings(...)` constructions keep working.
@@ -57,6 +58,12 @@ class Settings:
     # identity-tenant-service gRPC (ADR-0039 D1: GetOrgContext for Deepgram key terms). Same
     # variable name as mytheus-intelligence. Unset means streams open without key terms.
     identity_grpc_addr: str | None = None
+    # `/capture/audio` (the browser capture companion, `capture_in.py`). The HS256 secret
+    # mytheus-ui signs capture tokens with; unset or under 32 characters refuses every capture
+    # connection (fail closed). `CAPTURE_ALLOWED_ORIGINS` optionally pins the extension origins
+    # (`chrome-extension://<id>`, comma separated); unset admits any origin holding a valid token.
+    capture_token_secret: str | None = None
+    capture_allowed_origins: str | None = None
 
     def __repr__(self) -> str:
         # Never print secrets (DB URL credentials, provider keys, the audio token).
@@ -76,6 +83,8 @@ def load_settings_from_env() -> Settings:
         deepgram_model=os.environ.get("DEEPGRAM_MODEL") or "nova-3",
         deepgram_language=os.environ.get("DEEPGRAM_LANGUAGE") or "multi",
         identity_grpc_addr=os.environ.get("IDENTITY_GRPC_ADDR") or None,
+        capture_token_secret=os.environ.get("CAPTURE_TOKEN_SECRET") or None,
+        capture_allowed_origins=os.environ.get("CAPTURE_ALLOWED_ORIGINS") or None,
         livekit_url=os.environ.get("LIVEKIT_URL") or None,
         livekit_api_key=os.environ.get("LIVEKIT_API_KEY") or None,
         livekit_api_secret=os.environ.get("LIVEKIT_API_SECRET") or None,
