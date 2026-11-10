@@ -123,7 +123,9 @@ import {
 //                                          from GET /api/v1/meetings/:id/context-fills.
 //
 //   "agent-alert" ({ meetingId, payload: { id, meetingId, alertType, priority, title, body,
-//                   confidence, rationale, subject, related, link, createdAt } })
+//                   confidence, rationale, subject, related, link, createdAt,
+//                   [decisionId, decisionContent, decidedAt, meetingTitle]  (already_decided)
+//                   [topic, snippet, meetingTitle]                          (topic_watch) } })
 //                                       — ProactiveAgent `alert` output (Phase P11, plan 3.7;
 //                                          P11 contract section 4), only for a surfaced alert.
 //                                          PRIVATE like "agent-suggestion": emitted (reliable) only
@@ -134,6 +136,13 @@ import {
 //                                          not in that meeting it waits (24 h, at most 100 per
 //                                          user) and is drained when they join it. So the outer
 //                                          `meetingId` always equals `payload.meetingId`.
+//                                          `alertType` is "conflict", "workload", "dependency",
+//                                          "missing_stakeholder", or (mytheus-docs ADR-0039 C7)
+//                                          "already_decided" / "topic_watch", which add the
+//                                          bracketed fields above (agentOutput.ts validates them).
+//                                          A topic watcher is not in the meeting, so a
+//                                          "topic_watch" alert reaches a socket only if they join
+//                                          it within 24 h; the notifications list has it anyway.
 //                                          Durable copy: GET /notifications?meeting_id=.
 //
 //   "agent-candidate" ({ meetingId, payload: { windowId, agent, kind, candidates } })
@@ -165,7 +174,7 @@ import {
 //                                          client re-hydrates the agenda from
 //                                          GET /api/v1/meetings/:id, never from this socket.
 //
-//   "agent-nudge" ({ meetingId, payload: { id, type, itemId, content } })
+//   "agent-nudge" ({ meetingId, payload: { id, type, itemId, content, [userId] } })
 //                                       — the non-null `nudge` of a MeetingAgent `meeting_update`
 //                                          record (ADR-0038 D7, D9), only for a surfaced record and
 //                                          a well-formed nudge; at most one per record, published
@@ -173,8 +182,13 @@ import {
 //                                          the host: emitted (reliable) only to the sockets whose
 //                                          resolved internal user id is the record's `user_id`
 //                                          (the host's id), never to the room. `type` is
-//                                          "off_agenda", "over_time" or "unaddressed"; `itemId` is
-//                                          an agenda item id or null; `content` is 1 to 200 chars.
+//                                          "off_agenda", "over_time", "unaddressed" or
+//                                          (mytheus-docs ADR-0039 C5) "proxy_update"; `itemId` is
+//                                          an agenda item id or null (never null for
+//                                          "proxy_update"); `content` is 1 to 200 chars, or 1 to
+//                                          2000 for "proxy_update", which carries the update of a
+//                                          participant who sent their agent instead (`userId`,
+//                                          when the producer names them).
 //                                          Not persisted and not replayed: a missed nudge is gone.
 //
 // Backpressure shed order (plan 3.7 step 4; P11 contract section 4): before every "agent-delta"

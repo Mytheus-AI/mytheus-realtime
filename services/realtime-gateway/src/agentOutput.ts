@@ -2,7 +2,7 @@
  * Agent output bridge: `agent-stream` and `agent-results` from Redpanda to the participant's
  * own sockets (PersonalListener) or to the whole meeting (decision/action candidates, the
  * MeetingAgent's agenda updates). Plan 7-9 section 3.4 steps 2 and 4; mytheus-docs ADR-0030 D5;
- * Phase 8 Part A section 3; ADR-0038 D9.
+ * Phase 8 Part A section 3; ADR-0038 D9; ADR-0039 D2 (the new alert and nudge types).
  *
  * Delivery path:
  *   1. Every gateway pod runs this consumer in ONE consumer group, so each record is handled by
@@ -44,6 +44,19 @@
  *     NOT published straight to the channel: the consumer hands them to `onAlert`, which queues
  *     them in the recipient's priority queue `nexus:{org_id}:queue:agent:{user_id}` and nudges
  *     the meeting channel so a pod holding that user's sockets drains it (alertQueue.ts).
+ *     `alert_type` is one of the P11 four ("conflict", "workload", "dependency",
+ *     "missing_stakeholder") or, from mytheus-docs ADR-0039 C7, "already_decided" or
+ *     "topic_watch", which carry their own fields as siblings in the alert object:
+ *       - "already_decided": a UUID `decision_id` and a non-empty `decision_content` (cut to
+ *         500), plus `decided_at` and `meeting_title` (strings or null), forwarded as
+ *         `decisionId`, `decisionContent`, `decidedAt`, `meetingTitle`;
+ *       - "topic_watch": a non-empty `topic` (cut to 80), plus `snippet` (cut to 200) and
+ *         `meeting_title`, forwarded as `topic`, `snippet`, `meetingTitle`.
+ *     Either one missing its required fields is dropped, and so is any alert whose own
+ *     `meeting_id`, when present, is not the record's meeting (an alert is only ever delivered
+ *     into its own meeting). Same queue, same delivery as the other alerts: a topic watcher is by
+ *     definition not in the meeting, so live delivery happens only if they join it within 24 h;
+ *     the durable copy is notification-service's.
  *   - `agent-results` `MeetingAgent`/`meeting_update` records (mytheus-docs ADR-0038 D7, D9),
  *     at most one per meeting per window, SPLIT into several messages by `routeAgentRecords`,
  *     and only when `payload_json` parses to an object with `surfaced === true` (otherwise the
@@ -55,11 +68,16 @@
  *         message has no `userId` and server.ts delivers it to every local socket on the
  *         channel. The live status is a hint only; core-api applies it to
  *         `meeting_agenda_items` (a host-set status wins).
- *       - a non-null `nudge` with a UUID `id`, a `type` of "off_agenda", "over_time" or
- *         "unaddressed", an `item_id` that is a UUID or null, and a non-empty string `content`
- *         (cut to 200 chars) becomes one "agent-nudge" message. PRIVATE to the host: tagged
- *         with the record's `user_id` (the MeetingAgent sets it to the host's id), delivered
- *         only to that user's sockets, never to the room.
+ *       - a non-null `nudge` with a UUID `id`, a `type` of "off_agenda", "over_time",
+ *         "unaddressed" or "proxy_update" (mytheus-docs ADR-0039 C5), an `item_id` that is a
+ *         UUID or null, and a non-empty string `content` (cut to 200 chars) becomes one
+ *         "agent-nudge" message. A "proxy_update" nudge carries the update of a participant who
+ *         sent their agent instead, so it must name its agenda item (`item_id` a UUID, never
+ *         null), its `content` is cut to 2000 chars (the update's own limit, ADR-0039 B5)
+ *         rather than 200, and an optional UUID `user_id` (the proxied participant) is
+ *         forwarded as `userId`. PRIVATE to the host: tagged with the record's `user_id` (the
+ *         MeetingAgent sets it to the host's id), delivered only to that user's sockets, never
+ *         to the room.
  *   Anything else (other agents, other kinds, a header without a UUID tenant) is skipped.
  *
  * Decoding: the consumer calls `registry.decode` with no reader schema, so each record is read
@@ -182,7 +200,14 @@ export interface AgentContextPayload {
   createdAt: string;
 }
 
-export type AlertType = "conflict" | "workload" | "dependency" | "missing_stakeholder";
+export type AlertType =
+  | "conflict"
+  | "workload"
+  | "dependency"
+  | "missing_stakeholder"
+  // mytheus-docs ADR-0039 C7
+  | "already_decided"
+  | "topic_watch";
 
 /** What an alert is about (P11 contract section 1). */
 export interface AlertSubject {
@@ -219,6 +244,20 @@ export interface AgentAlertPayload {
   link: string | null;
   /** ISO 8601, from the record header's `occurred_at`. */
   createdAt: string;
+  // Present only on the ADR-0039 C7 types, absent (not null) on the others so the P11 alerts'
+  // queue members are byte-for-byte what they were.
+  /** "already_decided": the confirmed decision the room re-opened. */
+  decisionId?: string;
+  /** "already_decided": that decision's content, at most 500 chars. */
+  decisionContent?: string;
+  /** "already_decided": when it was decided (as the producer sent it), or null. */
+  decidedAt?: string | null;
+  /** "topic_watch": the watched topic, at most 80 chars. */
+  topic?: string;
+  /** "topic_watch": what was said, at most 200 chars; may be empty. */
+  snippet?: string;
+  /** Both C7 types: the meeting's title, at most 200 chars; may be empty. */
+  meetingTitle?: string;
 }
 
 /** A MeetingAgent agenda status hint, the socket event "agent-agenda" (ADR-0038 D9). */
@@ -229,16 +268,19 @@ export interface AgentAgendaPayload {
   note: string;
 }
 
-export type NudgeType = "off_agenda" | "over_time" | "unaddressed";
+export type NudgeType = "off_agenda" | "over_time" | "unaddressed" | "proxy_update";
 
 /** A MeetingAgent nudge for the host, the socket event "agent-nudge" (ADR-0038 D9). */
 export interface AgentNudgePayload {
   id: string;
   type: NudgeType;
-  /** The agenda item the nudge is about, or null (an off-agenda nudge names none). */
+  /** The agenda item the nudge is about, or null (an off-agenda nudge names none). Never null
+   * for "proxy_update". */
   itemId: string | null;
-  /** At most 200 chars, never empty. */
+  /** Never empty; at most 200 chars, or 2000 for "proxy_update" (the proxied update itself). */
   content: string;
+  /** "proxy_update" only, when the producer names them: the participant who sent their agent. */
+  userId?: string;
 }
 
 export type AgentPubsubMessage =
@@ -450,7 +492,19 @@ function contextFillRecord(
   };
 }
 
-const ALERT_TYPES = new Set(["conflict", "workload", "dependency", "missing_stakeholder"]);
+const ALERT_TYPES = new Set([
+  "conflict",
+  "workload",
+  "dependency",
+  "missing_stakeholder",
+  "already_decided",
+  "topic_watch",
+]);
+const MAX_DECISION_CONTENT = 500;
+const MAX_TOPIC = 80;
+const MAX_SNIPPET = 200;
+const MAX_MEETING_TITLE = 200;
+const MAX_DECIDED_AT = 64;
 const SUBJECT_KINDS = new Set(["decision", "action", "meeting"]);
 const RELATED_KINDS = new Set(["decision", "action", "user"]);
 const MAX_RELATED = 10;
@@ -488,6 +542,35 @@ function relativeLink(raw: unknown): string | null {
   return raw.slice(0, 300);
 }
 
+/**
+ * The ADR-0039 C7 fields of an "already_decided" or "topic_watch" alert, or null when a required
+ * one is missing (the alert is then dropped). `{}` for the P11 types, which carry none.
+ */
+function alertExtras(alertType: string, a: Decoded): Partial<AgentAlertPayload> | null {
+  const meetingTitle = () => (typeof a.meeting_title === "string" ? a.meeting_title : "");
+  if (alertType === "already_decided") {
+    if (typeof a.decision_id !== "string" || !UUID_RE.test(a.decision_id)) return null;
+    if (typeof a.decision_content !== "string" || a.decision_content.trim().length === 0) {
+      return null;
+    }
+    return {
+      decisionId: a.decision_id,
+      decisionContent: a.decision_content.trim().slice(0, MAX_DECISION_CONTENT),
+      decidedAt: typeof a.decided_at === "string" ? a.decided_at.slice(0, MAX_DECIDED_AT) : null,
+      meetingTitle: meetingTitle().slice(0, MAX_MEETING_TITLE),
+    };
+  }
+  if (alertType === "topic_watch") {
+    if (typeof a.topic !== "string" || a.topic.trim().length === 0) return null;
+    return {
+      topic: a.topic.trim().slice(0, MAX_TOPIC),
+      snippet: typeof a.snippet === "string" ? a.snippet.slice(0, MAX_SNIPPET) : "",
+      meetingTitle: meetingTitle().slice(0, MAX_MEETING_TITLE),
+    };
+  }
+  return {};
+}
+
 function alertRecord(meetingId: string, header: Decoded, value: Decoded): AgentAlertPayload | null {
   if (value.agent !== "ProactiveAgent" || value.kind !== "alert") return null;
   const alert = parsePayload(value.payload_json)?.alert;
@@ -508,6 +591,16 @@ function alertRecord(meetingId: string, header: Decoded, value: Decoded): AgentA
   ) {
     return null;
   }
+  // An alert is only ever delivered into its own meeting: a payload naming another is dropped.
+  if (
+    a.meeting_id !== undefined &&
+    a.meeting_id !== null &&
+    (typeof a.meeting_id !== "string" || a.meeting_id.toLowerCase() !== meetingId.toLowerCase())
+  ) {
+    return null;
+  }
+  const extras = alertExtras(a.alert_type, a);
+  if (extras === null) return null;
   return {
     id: a.id,
     meetingId,
@@ -521,13 +614,16 @@ function alertRecord(meetingId: string, header: Decoded, value: Decoded): AgentA
     related: alertRelated(a.related),
     link: relativeLink(a.link),
     createdAt: occurredAtIso(header),
+    ...extras,
   };
 }
 
 const AGENDA_STATUSES = new Set(["in_progress", "covered"]);
-const NUDGE_TYPES = new Set(["off_agenda", "over_time", "unaddressed"]);
+const NUDGE_TYPES = new Set(["off_agenda", "over_time", "unaddressed", "proxy_update"]);
 const MAX_AGENDA_NOTE = 300;
 const MAX_NUDGE_CONTENT = 200;
+/** A proxied participant's update is up to 2000 chars (ADR-0039 B5); the nudge carries it whole. */
+const MAX_PROXY_UPDATE_CONTENT = 2000;
 
 function agendaUpdate(raw: unknown): AgentAgendaPayload | null {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -562,6 +658,18 @@ function meetingNudge(raw: unknown): AgentNudgePayload | null {
     n.content.trim().length === 0
   ) {
     return null;
+  }
+  if (n.type === "proxy_update") {
+    // Fired when a proxied participant's item goes in progress: it always names the item.
+    if (itemId === null) return null;
+    const proxied = typeof n.user_id === "string" && UUID_RE.test(n.user_id) ? n.user_id : null;
+    return {
+      id: n.id,
+      type: "proxy_update",
+      itemId,
+      content: n.content.slice(0, MAX_PROXY_UPDATE_CONTENT),
+      ...(proxied ? { userId: proxied } : {}),
+    };
   }
   return {
     id: n.id,
