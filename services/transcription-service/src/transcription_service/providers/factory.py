@@ -19,6 +19,7 @@ Deliberately mirrors `select_transport()` in
 from __future__ import annotations
 
 from ..config import Settings
+from ..org_context import GrpcOrgContextFetcher, OrgKeyterms
 from .base import (
     DEFAULT_ENCODING,
     DEFAULT_SAMPLE_RATE,
@@ -58,6 +59,11 @@ def select_provider(settings: Settings) -> TranscriptionProvider:
             api_key=settings.deepgram_api_key,
             model=settings.deepgram_model,
             language=settings.deepgram_language,
+            keyterms=(
+                OrgKeyterms(GrpcOrgContextFetcher(settings.identity_grpc_addr))
+                if settings.identity_grpc_addr
+                else None
+            ),
         )
     if settings.allow_fake_provider:
         return FakeProvider()

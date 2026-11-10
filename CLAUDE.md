@@ -154,6 +154,7 @@ Environment variables:
 | `SCHEMA_REGISTRY_URL` | both | Avro Schema Registry for `transcript-chunks` / `presence-events` |
 | `WS_BIND_HOST` / `WS_BIND_PORT` | realtime-gateway | WebSocket listener bind config |
 | `TRANSCRIPTION_WS_BIND` | transcription-service | Internal WS bind for the LiveKit audio hook |
+| `IDENTITY_GRPC_ADDR` | transcription-service | `identity-tenant-service` gRPC for `GetOrgContext` (the org's Deepgram key terms, ADR-0039 D1). Unset = streams open without key terms |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | both | OpenTelemetry traces/metrics export |
 
 ## Pitfalls
