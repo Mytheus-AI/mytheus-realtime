@@ -82,6 +82,24 @@ class ParticipantLease:
     # the stream reports (see `meeting_timeline`).
     meeting_offset_ms: int = 0
     superseded: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set only for a diarized stream that carries several people (the capture companion's tab
+    # channel, `capture_in.py`): each provider speaker index becomes `{prefix}{index + 1}`
+    # instead of the connection's single participant identity.
+    speaker_prefix: str | None = None
+
+
+def speaker_for(lease: ParticipantLease, provider_speaker: str) -> str:
+    """Who an utterance is attributed to. A single-speaker connection (one participant track,
+    or the capture mic) is its participant identity, a `users.id`. A diarized multi-speaker
+    connection maps Deepgram's per-stream speaker index ("0", "1", ...) to a stable, readable,
+    non-UUID label (`remote-1`, `remote-2`, ...) that the downstream `meeting_speakers` mapping can
+    name, and that the agent runtime never mistakes for a user (it only adds UUID speakers to
+    its roster)."""
+    if lease.speaker_prefix is None:
+        return lease.participant_identity
+    raw = provider_speaker.strip()
+    label = str(int(raw) + 1) if raw.isdigit() else (raw or "1")
+    return f"{lease.speaker_prefix}{label}"[:256]
 
 
 def meeting_timeline(lease: ParticipantLease, start_ms: int, end_ms: int) -> tuple[int, int]:
@@ -185,13 +203,21 @@ class SessionTracker:
     # ------------------------------------------------------------------ participant streams
 
     async def attach_participant(
-        self, *, org_id: str, meeting_id: str, participant_identity: str
+        self,
+        *,
+        org_id: str,
+        meeting_id: str,
+        participant_identity: str,
+        diarize: bool = False,
+        speaker_prefix: str | None = None,
     ) -> ParticipantLease:
         """Opens (or reuses) the meeting session and opens a NEW provider stream for this
-        participant connection. A previous connection for the same participant is superseded
-        and its stream closed. Raises `TenantMismatchError` on an org mismatch; lets
-        `ComplianceGateClosedError` or any provider open failure propagate (and closes a
-        meeting session it opened just for this attach)."""
+        participant connection. `diarize`/`speaker_prefix` are for a connection that carries
+        several speakers (see `speaker_for`); the default is one speaker per connection. A
+        previous connection for the same participant is superseded and its stream closed.
+        Raises `TenantMismatchError` on an org mismatch; lets `ComplianceGateClosedError` or
+        any provider open failure propagate (and closes a meeting session it opened just for
+        this attach)."""
         async with self._lock_for(meeting_id):
             meeting = self._sessions.get(meeting_id)
             opened_here = False
@@ -218,7 +244,7 @@ class SessionTracker:
             async def _open_inner() -> TranscriptionStream:
                 # Region pin applies to the first connection and to every reconnect.
                 return await self.provider.open_stream(
-                    org_id=org_id, meeting_id=meeting_id, region=region, diarize=False
+                    org_id=org_id, meeting_id=meeting_id, region=region, diarize=diarize
                 )
 
             try:
@@ -235,6 +261,7 @@ class SessionTracker:
                 connection_id=str(uuid.uuid4()),
                 stream=stream,
                 meeting_offset_ms=offset_ms,
+                speaker_prefix=speaker_prefix if diarize else None,
             )
             lease.pump_task = asyncio.create_task(
                 self._pump(lease, pii_redaction_enabled=meeting.pii_redaction_enabled)
@@ -345,7 +372,7 @@ class SessionTracker:
                     meeting_id=lease.meeting_id,
                     utterance=replace(
                         utterance,
-                        speaker_id=lease.participant_identity,
+                        speaker_id=speaker_for(lease, utterance.speaker_id),
                         start_ms=start_ms,
                         end_ms=end_ms,
                     ),

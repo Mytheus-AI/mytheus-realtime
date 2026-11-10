@@ -127,6 +127,28 @@ access or provider contact. With no `DEEPGRAM_API_KEY`, the fake provider is use
 `TRANSCRIPTION_ALLOW_FAKE_PROVIDER=1` is set explicitly (local development); otherwise the
 service fails closed and refuses every connection with 1011.
 
+## transcription-service `/capture/audio` contract (the capture companion)
+
+Calls held on Google Meet, Microsoft Teams or the Zoom web client reach Mytheus through the
+Mytheus Capture Chrome extension (`mytheus-ui/extension/`). It streams two connections to
+`wss://<public host>/capture/audio`: `mic` (the user, attributed to their `users.id`) and `tab`
+(everyone else, diarized into `remote-1`, `remote-2`, ...). The authoritative definition is the
+module docstring of `services/transcription-service/src/transcription_service/capture_in.py`;
+in short:
+
+- Browsers cannot set headers, so the first frame is `{"type": "init", "token": "<capture
+  token>", "channel": "mic" | "tab", "sample_rate": 16000, "encoding": "pcm_s16le"}`. The
+  capture token is an HS256 JWT mytheus-ui's server signs with `CAPTURE_TOKEN_SECRET` after
+  creating the external meeting through core-api (`capture_auth.py` lists the claims). `org_id`
+  and `meeting_id` come only from the verified token.
+- The server answers `{"type": "ready", "meeting_id": ..., "channel": ...}`; then binary PCM and
+  `{"type": "stop"}` exactly as on `/internal/audio`.
+- Close codes are `/internal/audio`'s plus `4401` (token missing, invalid or expired: mint a
+  fresh one, then reconnect). The upgrade itself is refused (403) when `CAPTURE_TOKEN_SECRET`
+  is unset or when `CAPTURE_ALLOWED_ORIGINS` is set and the origin is not in it.
+- Consent: the token carries when the user confirmed they told the participants; each accepted
+  connection writes `transcription.capture_consent` to `audit_logs` before any audio flows.
+
 ## Environment variables
 
 | Variable | Service | Purpose |
@@ -143,6 +165,8 @@ service fails closed and refuses every connection with 1011.
 | `AUDIO_INIT_TIMEOUT_SECONDS` / `AUDIO_IDLE_TIMEOUT_SECONDS` | transcription-service | `/internal/audio` init (10 s) and idle (30 s) timeouts |
 | `AUDIO_MAX_FRAME_BYTES` / `AUDIO_QUEUE_MAX_FRAMES` | transcription-service | Max PCM frame size (65536) and backpressure queue depth (100 frames) |
 | `TRANSCRIPTION_ALLOW_FAKE_PROVIDER` | transcription-service | `1` lets the fake provider run when no Deepgram key is set (local dev only); default off = fail closed |
+| `CAPTURE_TOKEN_SECRET` | transcription-service | HS256 secret for capture tokens; the SAME value is set on mytheus-ui's server. Unset or under 32 characters refuses every `/capture/audio` connection |
+| `CAPTURE_ALLOWED_ORIGINS` | transcription-service | Optional comma-separated `chrome-extension://<id>` origins admitted to `/capture/audio`; unset admits any origin holding a valid token |
 | `DATABASE_URL` | transcription-service | Shared Postgres (`transcript_chunks`, `outbox`, tenant reads) |
 | `PORT` | realtime-gateway | Gateway listen port (default `8090`) |
 | `CORE_API_URL` | realtime-gateway | `core-api` base URL (dev: `http://localhost:8002`) |

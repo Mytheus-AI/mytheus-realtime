@@ -11,6 +11,9 @@ Routes:
   `mytheus-docs/work-done-till-now/`) now takes the pod out of rotation.
 - `WS /internal/audio` -- the audio hook. Contract, close codes and enforcement live in
   `audio_in.py`'s module docstring (and `README.md`).
+- `WS /capture/audio` -- audio from the Mytheus Capture browser extension (calls on Meet, Teams
+  or Zoom web), authenticated by a capture token in the first frame. Contract in
+  `capture_in.py`'s module docstring.
 
 On startup, launches `meeting_room_consumer.run_consumer` as a background task -- the
 `meeting-room-events` I/O loop whose `joined`/`left` hints open/close meeting sessions via
@@ -48,6 +51,8 @@ from .audio_in import (
     AudioHub,
     provider_mode_for,
 )
+from .capture_auth import secret_usable
+from .capture_in import CaptureHub, parse_allowed_origins
 from .config import load_settings_from_env
 from .db import make_engine, make_session_factory
 from .meeting_room_consumer import run_consumer
@@ -98,6 +103,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config=AudioEndpointConfig.from_settings(settings),
         provider_mode=provider_mode_for(provider),
     )
+    capture_hub = CaptureHub(
+        tracker=tracker,
+        config=AudioEndpointConfig.from_settings(settings),
+        provider_mode=provider_mode_for(provider),
+        secret=settings.capture_token_secret,
+        allowed_origins=parse_allowed_origins(settings.capture_allowed_origins),
+    )
+    if not secret_usable(settings.capture_token_secret):
+        logger.warning(
+            "CAPTURE_TOKEN_SECRET is unset or shorter than 32 characters: /capture/audio will "
+            "refuse every connection (capture companion not connected)"
+        )
     if provider_mode_for(provider) == "unavailable":
         logger.error(
             "no DEEPGRAM_API_KEY and TRANSCRIPTION_ALLOW_FAKE_PROVIDER is not 1: "
@@ -130,12 +147,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         return not consumer_task.done()
 
     app.state.audio_hub = audio_hub
+    app.state.capture_hub = capture_hub
     app.state.readiness = {"db": _db_ready, "redis": _redis_ready, "broker": _broker_ready}
 
     try:
         yield
     finally:
-        await audio_hub.drain(timeout=_AUDIO_DRAIN_TIMEOUT_SECONDS)
+        await asyncio.gather(
+            audio_hub.drain(timeout=_AUDIO_DRAIN_TIMEOUT_SECONDS),
+            capture_hub.drain(timeout=_AUDIO_DRAIN_TIMEOUT_SECONDS),
+        )
         # Signal, do not cancel: `run_consumer` must be allowed to finish its in-flight poll
         # before it closes the consumer, or `close()` races a worker thread still inside
         # `poll()`. See that function's docstring. Cancellation is the timeout fallback only.
@@ -193,6 +214,14 @@ def build_app(
             await websocket.close(code=CLOSE_INTERNAL_ERROR, reason="service not ready")
             return
         await hub.handle(websocket)
+
+    @application.websocket("/capture/audio")
+    async def capture_audio(websocket: WebSocket) -> None:
+        capture: CaptureHub | None = getattr(websocket.app.state, "capture_hub", None)
+        if capture is None:
+            await websocket.close(code=CLOSE_INTERNAL_ERROR, reason="service not ready")
+            return
+        await capture.handle(websocket)
 
     return application
 
