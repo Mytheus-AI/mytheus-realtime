@@ -92,9 +92,9 @@ def speaker_for(lease: ParticipantLease, provider_speaker: str) -> str:
     """Who an utterance is attributed to. A single-speaker connection (one participant track,
     or the capture mic) is its participant identity, a `users.id`. A diarized multi-speaker
     connection maps Deepgram's per-stream speaker index ("0", "1", ...) to a stable, readable,
-    non-UUID label (`remote-1`, `remote-2`, ...) that the downstream `meeting_speakers` mapping can
-    name, and that the agent runtime never mistakes for a user (it only adds UUID speakers to
-    its roster)."""
+    non-UUID label (`1`, `2`, ... with an empty prefix) that the downstream `meeting_speakers`
+    mapping can name, and that the agent runtime never mistakes for a user (it only adds UUID
+    speakers to its roster)."""
     if lease.speaker_prefix is None:
         return lease.participant_identity
     raw = provider_speaker.strip()

@@ -132,7 +132,7 @@ service fails closed and refuses every connection with 1011.
 Calls held on Google Meet, Microsoft Teams or the Zoom web client reach Mytheus through the
 Mytheus Capture Chrome extension (`mytheus-ui/extension/`). It streams two connections to
 `wss://<public host>/capture/audio`: `mic` (the user, attributed to their `users.id`) and `tab`
-(everyone else, diarized into `remote-1`, `remote-2`, ...). The authoritative definition is the
+(everyone else, diarized into speakers `1`, `2`, ...). The authoritative definition is the
 module docstring of `services/transcription-service/src/transcription_service/capture_in.py`;
 in short:
 

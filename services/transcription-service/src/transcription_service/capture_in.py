@@ -9,8 +9,9 @@ own browser and streams them here as two connections:
   participant track on `/internal/audio`, so the agent runtime adds them to the meeting's
   roster and their agents run on the call.
 - `tab`: the meeting tab's audio, i.e. everyone else. Opened DIARIZED, and each Deepgram speaker
-  becomes `remote-1`, `remote-2`, ... (`sessions.speaker_for`). Those labels are not user ids:
-  `meeting_speakers` can name them later, and the agent runtime never treats them as users.
+  becomes `1`, `2`, ... (`sessions.speaker_for`), which the app shows as "Speaker 1". Those
+  labels are not user ids: `meeting_speakers` can name them later, and the agent runtime never
+  treats them as users.
 
 Both feed the same `SessionTracker`, so everything downstream is unchanged: interims are live
 captions only, finals become one `transcript_chunks` row and one `transcript-chunks` record
@@ -88,7 +89,8 @@ CLOSE_UNAUTHORIZED = 4401
 CHANNEL_MIC = "mic"
 CHANNEL_TAB = "tab"
 CHANNELS = frozenset({CHANNEL_MIC, CHANNEL_TAB})
-TAB_SPEAKER_PREFIX = "remote-"
+# Deepgram speaker 0 becomes "1": the app renders a raw label as "Speaker 1".
+TAB_SPEAKER_PREFIX = ""
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,6 @@
 """`/capture/audio` (the Mytheus Capture browser extension) over fakes: the capture token,
 every refusal path, and the chunks a captured call emits -- mic attributed to the user,
-tab audio diarized into `remote-N` speakers -- through the same pipeline as a Mytheus room.
+tab audio diarized into numbered speakers -- through the same pipeline as a Mytheus room.
 
 No infrastructure: `FakeDatabase`/`FakeRedis` for Postgres and Redis, `FakeProvider` for
 Deepgram (and a patched `websockets.connect` for the one test that checks the real Deepgram
@@ -367,7 +367,7 @@ def test_mic_channel_emits_chunks_as_the_user_and_records_consent() -> None:
     assert not h.tracker.has_session(h.meeting_id), "the session closes with its last channel"
 
 
-def test_tab_channel_is_diarized_into_remote_speakers() -> None:
+def test_tab_channel_is_diarized_into_numbered_speakers() -> None:
     script = [
         Utterance(str(uuid.uuid4()), "0", 0, 900, "Can we move the launch?", True, 0.9),
         Utterance(str(uuid.uuid4()), "1", 900, 1800, "Only if legal signs off.", True, 0.9),
@@ -384,9 +384,9 @@ def test_tab_channel_is_diarized_into_remote_speakers() -> None:
             assert _expect_close(ws).code == audio_in.CLOSE_NORMAL
 
     assert h.provider.opens[0].diarize is True
-    assert [r["speaker_id"] for r in h.db.transcript_chunks] == ["remote-1", "remote-2"]
+    assert [r["speaker_id"] for r in h.db.transcript_chunks] == ["1", "2"]
     payloads = [json.loads(o["payload"]) for o in h.db.outbox]
-    assert [p["speaker_id"] for p in payloads] == ["remote-1", "remote-2"]
+    assert [p["speaker_id"] for p in payloads] == ["1", "2"]
     assert {p["meeting_id"] for p in payloads} == {h.meeting_id}
     (consent,) = [a for a in h.db.audit_logs if a["action"] == "transcription.capture_consent"]
     assert json.loads(consent["metadata"])["source"] == "zoom"
@@ -447,7 +447,7 @@ async def test_the_org_vocabulary_reaches_deepgram_for_a_captured_call() -> None
             meeting_id=meeting_id,
             participant_identity="capture-tab:u",
             diarize=True,
-            speaker_prefix="remote-",
+            speaker_prefix="",
         )
         await tracker.detach_participant(lease)
     query = parse_qs(urlparse(connect.call_args.args[0]).query)
