@@ -267,4 +267,72 @@ describe("agent output from the real broker to the owner's socket", () => {
     expect(got.bob[0]).toEqual(expected);
     expect(got.carol).toEqual([]);
   }, 90_000);
+
+  it("delivers a real context_fill record to the requester only, surfaced fills only", async () => {
+    const orgId = randomUUID();
+    const meetingId = randomUUID();
+    const alice = randomUUID();
+    const bob = randomUUID();
+    const clerkOrg = `org-${randomUUID()}`;
+    const aliceSocket = await join(clerkOrg, meetingId, orgId, alice);
+    const bobSocket = await join(clerkOrg, meetingId, orgId, bob);
+    const got: Record<string, unknown[]> = { alice: [], bob: [] };
+    aliceSocket.on("agent-context", (e) => got.alice.push(e));
+    bobSocket.on("agent-context", (e) => got.bob.push(e));
+
+    const resultsId = await registry.getLatestSchemaId("agent-results-value");
+    const windowId = `${meetingId}:4`;
+    const fillId = randomUUID();
+    const record = (userId: string, fill: unknown) => ({
+      header: header(orgId, `agentresult:${meetingId}:${windowId}:${userId}:ContextGapAgent`),
+      meeting_id: meetingId,
+      window_id: windowId,
+      user_id: userId,
+      agent: "ContextGapAgent",
+      kind: "context_fill",
+      relevance_score: 0,
+      confidence: fill ? 0.8 : 0,
+      content: fill ? "Acme was picked as the vendor." : "",
+      payload_json: JSON.stringify({
+        gap: { query: "vendor decision", query_class: "decision_lineage" },
+        collaborations: [],
+        fill,
+        prompt: "context_gap_agent@v1",
+        model_tier: "extract",
+      }),
+      source_chunk_ids: [],
+    });
+    // bob's record has no fill (a silent fall-through): nothing is forwarded for it
+    const nullFill = await registry.encode(resultsId, record(bob, null));
+    const surfaced = await registry.encode(
+      resultsId,
+      record(alice, {
+        id: fillId,
+        content: "Acme was picked as the vendor.",
+        confidence: 0.8,
+        surfaced: true,
+        rationale: "From the prior sync.",
+        hop: "rag",
+        responder: "rag",
+        citations: [],
+      }),
+    );
+    const deadline = Date.now() + 30_000;
+    while (got.alice.length === 0 && Date.now() < deadline) {
+      await producer.send({
+        topic: "agent-results",
+        messages: [
+          { key: orgId, value: nullFill },
+          { key: orgId, value: surfaced },
+        ],
+      });
+      await sleep(1500);
+    }
+    await sleep(500);
+    expect(got.alice[0]).toMatchObject({
+      meetingId,
+      payload: { id: fillId, meetingId, hop: "rag", responder: "rag", citations: [] },
+    });
+    expect(got.bob).toEqual([]);
+  }, 90_000);
 });
