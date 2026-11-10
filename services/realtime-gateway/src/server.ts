@@ -39,6 +39,7 @@ import {
   createPresenceEventsProducer,
   type PresenceEventsProducer,
 } from "./presenceEventsProducer";
+import { createPrivacy } from "./privacy";
 import { createRoomEvents } from "./roomEvents";
 
 // ---- Socket.io event contract (namespace `/v1`) ----------------------------------------------
@@ -57,6 +58,9 @@ import { createRoomEvents } from "./roomEvents";
 //     `{ ok: true, persisted: boolean }` and, when stored, broadcasts "chat-saved".
 //   "reauth", "candidate-resolved", "candidate-lock", "agenda-status", "hand", "reaction",
 //   "end-meeting" — room-wide events a participant starts; see roomEvents.ts for the contract.
+//   "caption-language", "off-record-request", "off-record-answer" — live translation and off
+//     the record; see privacy.ts for the contract (and the "off-record", "off-record-request",
+//     "off-record-answer" and "caption-translation" events it emits).
 //     The CLIENT'S AUTH: the handshake token is verified once, at connect (and on every
 //     reconnect, where the client's `auth` callback supplies a fresh one). "reauth" refreshes the
 //     token this socket presents to core-api afterwards, so chat persistence and the
@@ -405,6 +409,8 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     verifier: deps.jwtVerifier,
     logger,
   });
+  // Off the record and live caption translation (privacy.ts).
+  const privacy = createPrivacy({ nsp, redis: pubClient, coreApi: coreApiClient, logger });
 
   // Handshake: org_id ONLY from the Clerk JWT, never from the client payload. Fail closed.
   nsp.use(async (socket, next) => {
@@ -467,6 +473,13 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       deliverMeetingScoped(channel, localSockets, msg as AgentPubsubMessage);
       return;
     }
+    if (msg.type === "off-record" || msg.type === "caption-translation") {
+      // core-api's off-the-record state (to everyone) and a caption translation (only to the
+      // sockets that chose its language); privacy.ts. The meeting id comes from the channel.
+      const meetingId = extractMeetingId(channel);
+      if (meetingId !== null) privacy.deliver(meetingId, localSockets, msg);
+      return;
+    }
     if (msg.type === "agent-alert-queued") {
       const userId = (msg as Partial<AlertQueuedNudge>).userId;
       if (typeof userId !== "string" || userId.length === 0) return;
@@ -520,7 +533,13 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     localSockets: Set<Socket>,
     msg: AgentPubsubMessage,
   ): void {
-    if (msg.type === "agent-candidate" || msg.type === "agent-agenda") return;
+    if (
+      msg.type === "agent-candidate" ||
+      msg.type === "agent-agenda" ||
+      msg.type === "caption-translation"
+    ) {
+      return;
+    }
     const meetingId = extractMeetingId(channel);
     if (meetingId === null || typeof msg.userId !== "string" || msg.userId.length === 0) return;
     const outbound = { meetingId, payload: msg.payload };
@@ -706,9 +725,12 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
 
       // Who is editing which card and whose hand is up, for this socket only (roomEvents.ts).
       await roomEvents.sendRoomState(socket, meetingId);
+      // Whether the meeting is off the record right now, for this socket only (privacy.ts).
+      await privacy.sendState(socket, meetingId);
     });
 
     roomEvents.attach(socket);
+    privacy.attach(socket);
 
     socket.on("chat", async (payload: ChatPayload, rawAck?: unknown) => {
       const ack = typeof rawAck === "function" ? (rawAck as (res: ChatAck) => void) : undefined;
@@ -829,6 +851,8 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
 
     // This socket's edit locks and raised hand go with it (roomEvents.ts; never throws).
     await roomEvents.releaseOnDisconnect(data, socket.id, meetingId);
+    // Its caption language too, so the agent runtime stops translating for it (never throws).
+    await privacy.releaseOnDisconnect(data, socket.id, meetingId);
   }
 
   // Reconciliation sweep: reaps presence entries whose owning pod died without running its

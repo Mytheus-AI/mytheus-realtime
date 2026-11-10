@@ -118,3 +118,25 @@ export function candidateLocksKey(orgId: string, meetingId: string): string {
 export function raisedHandsKey(orgId: string, meetingId: string): string {
   return `nexus:${orgId}:hands:${meetingId}`;
 }
+
+/**
+ * Off the record (polish wave 3): set by core-api while a meeting is off the record (JSON
+ * `{segment_id, started_at, started_by}`), deleted when it ends. transcription-service, the
+ * agent runtime and the indexers enforce it; the gateway reads it on join so a socket that
+ * arrives mid-segment sees "Off the record" at once.
+ */
+export function offRecordKey(orgId: string, meetingId: string): string {
+  return `nexus:${orgId}:off-record:${meetingId}`;
+}
+
+/**
+ * The caption languages viewers of a meeting chose (live translation, polish wave 3): one
+ * Redis hash per meeting, field = socket id, value = an ISO 639-1 code. A hash rather than a
+ * plain set so two viewers of one language count separately and one leaving does not stop the
+ * other's translation; the agent runtime reads the distinct values (HVALS). Ephemeral: a socket's
+ * field goes with its disconnect, and the hash expires after six quiet hours (the backstop for a
+ * pod that died without running its disconnect handler).
+ */
+export function captionLangsKey(orgId: string, meetingId: string): string {
+  return `nexus:${orgId}:caption-langs:${meetingId}`;
+}
