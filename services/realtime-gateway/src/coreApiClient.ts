@@ -138,6 +138,14 @@ export interface CoreApiClient {
   /** The meeting (status, host, creator, agenda, wrap-up), read with the actor's token. Null on
    * failure. */
   getMeeting(params: CoreReadParams): Promise<MeetingState | null>;
+  /**
+   * "In every meeting at once": the caller's internal ids (`GET /api/v1/listening/whoami`, read
+   * with the socket's own token), for subscribing it to its person's channel. Null on any
+   * non-200, a malformed body or a network failure: no identity, no subscription. Optional so
+   * older test doubles still satisfy the interface; the gateway treats a missing method as
+   * "unavailable".
+   */
+  whoami?(params: { bearerToken: string }): Promise<{ userId: string; orgId: string } | null>;
 }
 
 export interface CoreApiClientOptions {
@@ -231,6 +239,23 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
         };
       } catch (err) {
         options.logger?.warn({ err, meetingId }, "core-api meeting read failed");
+        return null;
+      }
+    },
+
+    async whoami({ bearerToken }) {
+      try {
+        const res = await fetchFn(`${options.baseUrl}/api/v1/listening/whoami`, {
+          headers: { Authorization: `Bearer ${bearerToken}` },
+        });
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as { user_id?: unknown; org_id?: unknown };
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (typeof body.user_id !== "string" || typeof body.org_id !== "string") return null;
+        if (!uuid.test(body.user_id) || !uuid.test(body.org_id)) return null;
+        return { userId: body.user_id, orgId: body.org_id };
+      } catch (err) {
+        options.logger?.warn({ err }, "core-api whoami failed");
         return null;
       }
     },
