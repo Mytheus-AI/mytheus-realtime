@@ -86,6 +86,13 @@ export interface CandidateState {
   confirmed_by?: string | null;
 }
 
+/** The incoming resume point of a meeting (`GET /api/v1/meetings/:id/resume-point`), as far as the
+ * gateway needs it to verify a `resume-point` announcement. */
+export interface IncomingResumePoint {
+  id: string;
+  status: string;
+}
+
 /** The fields of core-api's `MeetingDetail` this gateway reads to verify a host action. */
 export interface MeetingState {
   id: string;
@@ -138,6 +145,17 @@ export interface CoreApiClient {
   /** The meeting (status, host, creator, agenda, wrap-up), read with the actor's token. Null on
    * failure. */
   getMeeting(params: CoreReadParams): Promise<MeetingState | null>;
+  /** The thread this meeting picks up ("pick up where we stopped"), read with the actor's
+   * token: `{ incoming }` (null when there is none), or null on any failure. */
+  getResumePoint(params: CoreReadParams): Promise<{ incoming: IncomingResumePoint | null } | null>;
+  /**
+   * "In every meeting at once": the caller's internal ids (`GET /api/v1/listening/whoami`, read
+   * with the socket's own token), for subscribing it to its person's channel. Null on any
+   * non-200, a malformed body or a network failure: no identity, no subscription. Optional so
+   * older test doubles still satisfy the interface; the gateway treats a missing method as
+   * "unavailable".
+   */
+  whoami?(params: { bearerToken: string }): Promise<{ userId: string; orgId: string } | null>;
 }
 
 export interface CoreApiClientOptions {
@@ -210,6 +228,24 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
       }
     },
 
+    async getResumePoint({ meetingId, bearerToken }) {
+      try {
+        const res = await fetchFn(
+          `${options.baseUrl}/api/v1/meetings/${encodeURIComponent(meetingId)}/resume-point`,
+          { headers: { Authorization: `Bearer ${bearerToken}` } },
+        );
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as { incoming?: Partial<IncomingResumePoint> | null };
+        const inc = body?.incoming;
+        if (inc === null || inc === undefined) return { incoming: null };
+        if (typeof inc.id !== "string" || typeof inc.status !== "string") return null;
+        return { incoming: { id: inc.id, status: inc.status } };
+      } catch (err) {
+        options.logger?.warn({ err, meetingId }, "core-api resume point read failed");
+        return null;
+      }
+    },
+
     async getMeeting({ meetingId, bearerToken }) {
       try {
         const res = await fetchFn(
@@ -231,6 +267,23 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
         };
       } catch (err) {
         options.logger?.warn({ err, meetingId }, "core-api meeting read failed");
+        return null;
+      }
+    },
+
+    async whoami({ bearerToken }) {
+      try {
+        const res = await fetchFn(`${options.baseUrl}/api/v1/listening/whoami`, {
+          headers: { Authorization: `Bearer ${bearerToken}` },
+        });
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as { user_id?: unknown; org_id?: unknown };
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (typeof body.user_id !== "string" || typeof body.org_id !== "string") return null;
+        if (!uuid.test(body.user_id) || !uuid.test(body.org_id)) return null;
+        return { userId: body.user_id, orgId: body.org_id };
+      } catch (err) {
+        options.logger?.warn({ err }, "core-api whoami failed");
         return null;
       }
     },

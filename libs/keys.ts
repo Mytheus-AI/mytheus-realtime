@@ -38,6 +38,17 @@ export function pubsubChannel(orgId: string, meetingId: string): string {
 }
 
 /**
+ * A person's own fan-out channel: `nexus:{org_id}:pubsub:user:{user_id}` ("In every meeting at
+ * once"). core-api publishes to it when the person's agent interrupts them about a live meeting
+ * they are not in (`agent-interrupt`) and when a host shares or sets aside their view
+ * (`view-status`). Every gateway pod holding a socket of that person that asked to `listen` is
+ * subscribed; the channel, not the message body, decides who gets it. Internal UUIDs only.
+ */
+export function userChannel(orgId: string, userId: string): string {
+  return `nexus:${orgId}:pubsub:user:${userId}`;
+}
+
+/**
  * Verbatim canonical live presence set key: `nexus:{org_id}:presence:{meeting_id}`
  * (_canon/02-data-model.md §5). Ephemeral only — Redis is the only store, never a durable table.
  */
@@ -139,4 +150,15 @@ export function offRecordKey(orgId: string, meetingId: string): string {
  */
 export function captionLangsKey(orgId: string, meetingId: string): string {
   return `nexus:${orgId}:caption-langs:${meetingId}`;
+}
+
+/**
+ * "After the meeting" layer 1: the moments the room saw someone not get in (an unmute that was
+ * spoken over, a raised hand never called), one JSON string per signal:
+ * `nexus:{org_id}:room-signals:{meeting_id}`, a Redis LIST (newest 500, 48 h). Private: never
+ * broadcast. core-api reads it after the meeting ended and files it into `room_signals`
+ * (mytheus-backend `services/core_api/room_signals.py` `signals_key`, the same shape).
+ */
+export function roomSignalsKey(orgId: string, meetingId: string): string {
+  return `nexus:${orgId}:room-signals:${meetingId}`;
 }

@@ -23,7 +23,7 @@ import pino, { type Logger } from "pino";
 import { Namespace, Server, type Socket } from "socket.io";
 
 import { createClerkJwtVerifier, type ClerkJwtVerifier } from "../../../libs/auth";
-import { presenceKey, pubsubChannel, roomName } from "../../../libs/keys";
+import { presenceKey, pubsubChannel, roomName, userChannel } from "../../../libs/keys";
 import {
   createAgentOutputConsumer,
   type AgentOutputConsumer,
@@ -221,6 +221,26 @@ import { createRoomEvents } from "./roomEvents";
 // behind the backlog. A
 // dropped delta costs only the typing effect; the final card carries the whole text.
 //
+// In every meeting at once (Beyond the meeting, Layer 3):
+//
+//   client -> server "listen" ([payload], ack?: (res: ListenAck) => void)
+//                                       — subscribes this socket to its person's own channel
+//                                          `nexus:{org_id}:pubsub:user:{user_id}`. The identity is
+//                                          core-api's (`GET /api/v1/listening/whoami` with the
+//                                          socket's own bearer), never the payload, which is
+//                                          ignored. `{ ok: false, error: "UNAVAILABLE" }` when it
+//                                          cannot be resolved. Idempotent per socket.
+//   server -> client "agent-interrupt" ({ payload })  — the person's agent interrupts them about
+//                                          a live meeting they are not in (core-api's
+//                                          `Interruption`, verbatim). Only to that person's
+//                                          listening sockets; the channel decides, not the body.
+//   server -> client "view-status" ({ payload })      — the host shared or set aside their view.
+//   server -> client "listeners" ({ meetingId, payload: { count, userIds } }) — in a joined room,
+//                                          how many agents listen (to everyone in the room).
+//   server -> client "meeting-view" ({ meetingId, payload }) — a view or a held line posted into
+//                                          the meeting by someone who is not in it. PRIVATE to the
+//                                          host (the record's `userId`), who shares it or not.
+//
 // Disconnect: presence is removed from every meeting the socket had joined, "presence" is
 // re-broadcast per meeting, and a "leave" `presence-events` record is produced per meeting. This
 // is the GRACEFUL path — it requires this process to still be alive to run it. Presence is also
@@ -251,6 +271,14 @@ export type ChatAck =
 /** Longest chat message the room relays and persists (core-api accepts up to 10,000). */
 export const CHAT_MAX_CHARS = 2000;
 
+export interface ListenAck {
+  ok: boolean;
+  error?: "UNAVAILABLE";
+}
+
+/** At most this many ids ride a "listeners" message to the room. */
+export const LISTENERS_MAX_IDS = 200;
+
 interface SocketData {
   /** From the JWT `org_id` claim — Clerk's opaque org id, NOT a UUID. Used only for the trust
    * boundary (deny-by-default authz) and forwarded to core-api, which resolves it server-side.
@@ -276,6 +304,8 @@ interface SocketData {
    */
   presenceOrgId: string;
   presenceUserId: string;
+  /** The person's own channel once the socket asked to `listen` (In every meeting at once). */
+  listenChannel?: string;
 }
 
 export interface AppConfig {
@@ -327,6 +357,19 @@ export interface App {
   queueAlert(routed: RoutedAgentMessage): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
+}
+
+const USER_CHANNEL = /^nexus:(.+):pubsub:user:(.+)$/;
+
+/** The room's "N agents listening": a count and the ids, nothing else core-api might add. */
+export function sanitizeListeners(raw: unknown): { count: number; userIds: string[] } | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const { count, userIds } = raw as { count?: unknown; userIds?: unknown };
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 0) return null;
+  const ids = Array.isArray(userIds)
+    ? userIds.filter((u): u is string => typeof u === "string").slice(0, LISTENERS_MAX_IDS)
+    : [];
+  return { count, userIds: ids };
 }
 
 export function createApp(config: AppConfig, deps: AppDeps): App {
@@ -472,6 +515,19 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
       logger.warn({ channel }, "discarding malformed message on caption channel");
       return;
     }
+    const person = USER_CHANNEL.exec(channel);
+    if (person !== null) {
+      deliverToPerson(person[2], localSockets, msg);
+      return;
+    }
+    if (msg.type === "listeners" || msg.type === "meeting-view") {
+      deliverListening(
+        channel,
+        localSockets,
+        msg as { type: string; userId?: unknown; payload?: unknown },
+      );
+      return;
+    }
     if (msg.type === "agent-candidate" || msg.type === "agent-agenda") {
       deliverMeetingScoped(channel, localSockets, msg as AgentPubsubMessage);
       return;
@@ -602,6 +658,44 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     }
   }
 
+  /**
+   * A message on a person's own channel (In every meeting at once). Every local socket on that
+   * channel belongs to that person (it subscribed through `listen`, with core-api's identity),
+   * so the channel is the authorization; a body naming somebody else is dropped as a mismatch.
+   */
+  function deliverToPerson(
+    userId: string,
+    localSockets: Set<Socket>,
+    msg: { type?: string; userId?: unknown; payload?: unknown },
+  ): void {
+    if (msg.type !== "agent-interrupt" && msg.type !== "view-status") return;
+    if (msg.userId !== undefined && msg.userId !== userId) return;
+    if (msg.payload === null || typeof msg.payload !== "object") return;
+    for (const socket of localSockets) socket.emit(msg.type, { payload: msg.payload });
+  }
+
+  /** "listeners" goes to the whole room; "meeting-view" only to the host it names. */
+  function deliverListening(
+    channel: string,
+    localSockets: Set<Socket>,
+    msg: { type: string; userId?: unknown; payload?: unknown },
+  ): void {
+    const meetingId = extractMeetingId(channel);
+    if (meetingId === null) return;
+    if (msg.type === "listeners") {
+      const payload = sanitizeListeners(msg.payload);
+      if (payload === null) return;
+      for (const socket of localSockets) socket.emit("listeners", { meetingId, payload });
+      return;
+    }
+    if (typeof msg.userId !== "string" || msg.userId.length === 0) return;
+    if (msg.payload === null || typeof msg.payload !== "object") return;
+    for (const socket of localSockets) {
+      if ((socket.data as SocketData).presenceUserId !== msg.userId) continue;
+      socket.emit("meeting-view", { meetingId, payload: msg.payload });
+    }
+  }
+
   function extractMeetingId(channel: string): string | null {
     const match = /^nexus:(.+):pubsub:meeting:(.+)$/.exec(channel);
     return match ? match[2] : null;
@@ -617,7 +711,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     meetingId: string,
     socket: Socket,
   ): Promise<void> {
-    const channel = pubsubChannel(orgId, meetingId);
+    await subscribeChannel(pubsubChannel(orgId, meetingId), socket);
+  }
+
+  async function subscribeChannel(channel: string, socket: Socket): Promise<void> {
     let localSockets = localChannelSockets.get(channel);
     if (!localSockets) {
       localSockets = new Set();
@@ -635,7 +732,10 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     meetingId: string,
     socket: Socket,
   ): Promise<void> {
-    const channel = pubsubChannel(orgId, meetingId);
+    await unsubscribeChannel(pubsubChannel(orgId, meetingId), socket);
+  }
+
+  async function unsubscribeChannel(channel: string, socket: Socket): Promise<void> {
     const localSockets = localChannelSockets.get(channel);
     if (!localSockets) return;
     localSockets.delete(socket);
@@ -648,6 +748,37 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
   nsp.on("connection", (socket: Socket) => {
     const { orgId, userId } = socket.data as SocketData;
     logger.info({ orgId, userId, socketId: socket.id }, "socket connected");
+
+    socket.on("listen", async (...args: unknown[]) => {
+      const ack = args.find((a): a is (res: ListenAck) => void => typeof a === "function");
+      const data = socket.data as SocketData;
+      if (data.listenChannel !== undefined) {
+        ack?.({ ok: true });
+        return;
+      }
+      const me = coreApiClient.whoami
+        ? await coreApiClient.whoami({ bearerToken: data.bearerToken })
+        : null;
+      if (me === null) {
+        ack?.({ ok: false, error: "UNAVAILABLE" });
+        return;
+      }
+      if (socket.disconnected || data.listenChannel !== undefined) {
+        ack?.({ ok: socket.connected });
+        return;
+      }
+      const channel = userChannel(me.orgId, me.userId);
+      data.listenChannel = channel;
+      try {
+        await subscribeChannel(channel, socket);
+      } catch (err) {
+        data.listenChannel = undefined;
+        logger.error({ err }, "person channel subscribe failed");
+        ack?.({ ok: false, error: "UNAVAILABLE" });
+        return;
+      }
+      ack?.({ ok: true });
+    });
 
     socket.on("join", async (payload: JoinPayload, ack?: (res: JoinAck) => void) => {
       const meetingId = payload?.meetingId;
@@ -806,6 +937,15 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
         clearInterval(data.heartbeatTimers.get(meetingId));
         data.heartbeatTimers.delete(meetingId);
         const cleanup = cleanupMeetingOnDisconnect(data, meetingId, socket);
+        pendingDisconnectCleanups.add(cleanup);
+        void cleanup.finally(() => pendingDisconnectCleanups.delete(cleanup));
+      }
+      const listening = data.listenChannel;
+      if (listening !== undefined) {
+        data.listenChannel = undefined;
+        const cleanup = unsubscribeChannel(listening, socket).catch((err: unknown) =>
+          logger.error({ err }, "person channel unsubscribe failed on disconnect"),
+        );
         pendingDisconnectCleanups.add(cleanup);
         void cleanup.finally(() => pendingDisconnectCleanups.delete(cleanup));
       }
