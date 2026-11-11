@@ -29,10 +29,19 @@
  *                                                                 gateway uses on core-api calls
  *   "candidate-resolved" ({ meetingId, candidateId, outcome })    outcome: confirmed|edited|dismissed
  *   "candidate-lock"     ({ meetingId, candidateId, locked })     ack adds `holder` when refused
- *   "agenda-status"      ({ meetingId, itemId } | { meetingId, itemIds })
+ *   "agenda-status"      ({ meetingId, itemId } | { meetingId, itemIds, replaced? })
  *                                                                 after the host's PATCH (mark,
- *                                                                 extend) or "Start next" succeeded
- *   "hand"               ({ meetingId, raised })
+ *                                                                 extend) or "Start next" succeeded;
+ *                                                                 `replaced: true` after the host
+ *                                                                 replaced the whole agenda (PUT)
+ *   "hand"               ({ meetingId, raised, userId?, reason? })
+ *                                                                 your own hand; or, with `userId`
+ *                                                                 of someone else, the host (or
+ *                                                                 creator) lowering it: `raised`
+ *                                                                 false, `reason` "lowered" or
+ *                                                                 "called" (called on to speak).
+ *                                                                 Your own lower may say "spoke"
+ *                                                                 (lowered as you started talking)
  *   "reaction"           ({ meetingId, reaction })                one of REACTIONS
  *   "end-meeting"        ({ meetingId })                          after the host's PATCH succeeded
  *   "wrap-up"            ({ meetingId })                          after the host opened or
@@ -41,15 +50,27 @@
  * Server -> client, to everyone in the meeting (`{ meetingId, payload }`):
  *   "candidate-resolution" { candidateId, kind, outcome, byUserId, at, row }
  *   "candidate-lock"       { candidateId, byUserId | null, until | null }
- *   "agenda-status"        { item, items, byUserId, at }   `items`: every stored row named, in
+ *   "agenda-status"        { item, items, byUserId, at, replaced? }
+ *                                                          `items`: every stored row named, in
  *                                                          agenda order; `item` is the first
- *                                                          (kept for clients that read one)
- *   "hand"                 { userId, raised, at }
+ *                                                          (kept for clients that read one). With
+ *                                                          `replaced: true`, `items` is the whole
+ *                                                          stored agenda, to be taken as it is
+ *   "hand"                 { userId, raised, at, raisedAt, byUserId, reason }
+ *                                                          `raisedAt`: when the hand went up (the
+ *                                                          queue order; a second raise keeps it);
+ *                                                          `at`: when this change happened;
+ *                                                          `reason`: raised | lowered | spoke |
+ *                                                          called | left
  *   "reaction"             { id, userId, reaction, at }
  *   "meeting-ended"        { byUserId, at }
  *   "wrap-up"              { state: "started" | "cancelled", startedAt, endsAt, byUserId, at }
  * and to the joining socket only, right after a successful "join":
  *   "room-state"           { locks: [{ candidateId, byUserId, until }], hands: [{ userId, at }] }
+ *                                                          hands oldest first: the queue
+ *
+ * A raised hand survives a short drop: when its socket goes, the hand is lowered only if that
+ * person has not re-joined within HAND_GRACE_MS (a re-join takes the hand over, place kept).
  */
 import { randomUUID } from "node:crypto";
 
@@ -65,6 +86,11 @@ export const LOCK_TTL_MS = 90_000;
 /** A quiet meeting's lock and hand hashes disappear on their own after this long. */
 const HASH_TTL_MS = 6 * 60 * 60 * 1000;
 export const REACTION_MIN_INTERVAL_MS = 600;
+/** How long a raised hand waits for its owner to re-join after their socket drops. */
+export const HAND_GRACE_MS = 15_000;
+export type HandReason = "raised" | "lowered" | "spoke" | "called" | "left";
+const OWN_LOWER_REASONS: readonly string[] = ["lowered", "spoke"];
+const HOST_LOWER_REASONS: readonly string[] = ["lowered", "called"];
 /** The close-out wrap-up's length; the deadline is the stored start plus this. */
 export const WRAP_UP_MS = 60_000;
 /** "Start next" touches at most two items; a full-agenda update is still bounded (ADR-0038 D5). */
@@ -114,6 +140,60 @@ export interface RoomEventsDeps {
   verifier: ClerkJwtVerifier;
   logger: Logger;
   now?: () => number;
+  /** Overrides HAND_GRACE_MS (tests). */
+  handGraceMs?: number;
+}
+
+export interface HandEntry {
+  socketId: string;
+  /** When the hand went up (ms). */
+  at: number;
+}
+
+export function parseHand(raw: string | null | undefined): HandEntry | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<HandEntry>;
+    if (typeof v.socketId !== "string" || typeof v.at !== "number") return null;
+    return { socketId: v.socketId, at: v.at };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What a "hand" request may do. Pure, so the rules are tested on their own: your own hand up or
+ * down (down may say "spoke"); someone else's only down, and only by the host or creator, saying
+ * "lowered" or "called". Returns the target and the reason, or the refusal.
+ */
+export function handIntent(
+  payload: { raised?: unknown; userId?: unknown; reason?: unknown },
+  actorUserId: string,
+):
+  | { ok: true; target: string; raised: boolean; reason: HandReason; forOther: boolean }
+  | { ok: false; error: "INVALID_PAYLOAD" } {
+  const { raised, userId, reason } = payload;
+  if (typeof raised !== "boolean") return { ok: false, error: "INVALID_PAYLOAD" };
+  if (userId !== undefined && userId !== null && !isId(userId))
+    return { ok: false, error: "INVALID_PAYLOAD" };
+  const target = typeof userId === "string" ? userId : actorUserId;
+  const forOther = target !== actorUserId;
+  if (raised) {
+    if (forOther || (reason !== undefined && reason !== "raised"))
+      return { ok: false, error: "INVALID_PAYLOAD" };
+    return { ok: true, target, raised, reason: "raised", forOther };
+  }
+  const allowed = forOther ? HOST_LOWER_REASONS : OWN_LOWER_REASONS;
+  if (reason !== undefined && (typeof reason !== "string" || !allowed.includes(reason))) {
+    return { ok: false, error: "INVALID_PAYLOAD" };
+  }
+  return {
+    ok: true,
+    target,
+    raised,
+    reason: (reason as HandReason | undefined) ?? "lowered",
+    forOther,
+  };
 }
 
 const ID = /^[A-Za-z0-9_-]{1,80}$/;
@@ -196,9 +276,48 @@ end
 return 0
 `;
 
+// Raise a hand: keep the stored raise time when the hand is already up (re-pointing it at this
+// socket), else store the new one. Returns the entry now stored.
+const RAISE_HAND = `
+local cur = redis.call('HGET', KEYS[1], ARGV[1])
+local out = ARGV[2]
+if cur then
+  local ok, d = pcall(cjson.decode, cur)
+  if ok and type(d) == 'table' and tonumber(d['at']) then
+    out = cjson.encode({ socketId = ARGV[3], at = tonumber(d['at']) })
+  end
+end
+redis.call('HSET', KEYS[1], ARGV[1], out)
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+return out
+`;
+
+// Take a hand over for a re-joined socket, keeping its raise time; nothing when it is down.
+const REBIND_HAND = `
+local cur = redis.call('HGET', KEYS[1], ARGV[1])
+if not cur then return 0 end
+local ok, d = pcall(cjson.decode, cur)
+if not ok or type(d) ~= 'table' or not tonumber(d['at']) then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], cjson.encode({ socketId = ARGV[2], at = tonumber(d['at']) }))
+return 1
+`;
+
+// Lower a hand only if it is still held by the socket that left.
+const DROP_HAND_IF = `
+local cur = redis.call('HGET', KEYS[1], ARGV[1])
+if not cur then return 0 end
+local ok, d = pcall(cjson.decode, cur)
+if ok and type(d) == 'table' and d['socketId'] ~= ARGV[2] then return 0 end
+redis.call('HDEL', KEYS[1], ARGV[1])
+return 1
+`;
+
 export function createRoomEvents(deps: RoomEventsDeps) {
   const { nsp, redis, coreApi, verifier, logger } = deps;
   const now = deps.now ?? (() => Date.now());
+  const handGraceMs = deps.handGraceMs ?? HAND_GRACE_MS;
+  const graceTimers = new Set<ReturnType<typeof setTimeout>>();
+  let stopped = false;
 
   function room(data: RoomSocketData, meetingId: string) {
     return nsp.to(roomName(data.presenceOrgId, meetingId));
@@ -391,11 +510,12 @@ export function createRoomEvents(deps: RoomEventsDeps) {
     socket.on(
       "agenda-status",
       async (
-        payload: { meetingId?: unknown; itemId?: unknown; itemIds?: unknown },
+        payload: { meetingId?: unknown; itemId?: unknown; itemIds?: unknown; replaced?: unknown },
         rawAck?: unknown,
       ) => {
         const ack = safeAck(rawAck);
         const { meetingId, itemId, itemIds } = payload ?? {};
+        const replaced = payload?.replaced === true;
         if (!joined(data, meetingId, ack)) return;
         // One item (a mark or an extend) or several ("Start next" finishes one and starts the
         // next): every id must be well formed, and there must be at least one.
@@ -415,18 +535,27 @@ export function createRoomEvents(deps: RoomEventsDeps) {
         }
         const wanted = new Set(ids);
         const items = meeting.agenda.filter((it) => wanted.has(it.id));
-        // Every named item must exist and be host-set in the stored agenda, or nothing is said.
-        if (items.length !== wanted.size || items.some((it) => it.status_source !== "host")) {
+        // Every named item must exist in the stored agenda and, for a status change, be host-set
+        // there, or nothing is said. A replaced agenda (the host's PUT) is new rows, set by
+        // nobody yet: it is announced whole, as stored.
+        if (
+          items.length !== wanted.size ||
+          (!replaced && items.some((it) => it.status_source !== "host"))
+        ) {
           ack({ ok: false, error: "NOT_VERIFIED" });
           return;
         }
+        const announced = replaced
+          ? [...meeting.agenda].sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0))
+          : items;
         room(data, meetingId).emit("agenda-status", {
           meetingId,
           payload: {
-            item: items[0],
-            items,
+            item: announced[0],
+            items: announced,
             byUserId: data.presenceUserId,
             at: new Date(now()).toISOString(),
+            ...(replaced ? { replaced: true } : {}),
           },
         });
         ack({ ok: true });
@@ -435,22 +564,55 @@ export function createRoomEvents(deps: RoomEventsDeps) {
 
     socket.on(
       "hand",
-      async (payload: { meetingId?: unknown; raised?: unknown }, rawAck?: unknown) => {
+      async (
+        payload: { meetingId?: unknown; raised?: unknown; userId?: unknown; reason?: unknown },
+        rawAck?: unknown,
+      ) => {
         const ack = safeAck(rawAck);
-        const { meetingId, raised } = payload ?? {};
+        const meetingId = payload?.meetingId;
         if (!joined(data, meetingId, ack)) return;
-        if (typeof raised !== "boolean") {
-          ack({ ok: false, error: "INVALID_PAYLOAD" });
+        const intent = handIntent(payload ?? {}, data.presenceUserId);
+        if (!intent.ok) {
+          ack({ ok: false, error: intent.error });
           return;
         }
+        // Lowering someone else's hand is the host's (or creator's), as core-api decides it.
+        if (intent.forOther) {
+          const meeting = await coreApi.getMeeting({ meetingId, bearerToken: data.bearerToken });
+          if (!meeting) {
+            ack({ ok: false, error: "NOT_VERIFIED" });
+            return;
+          }
+          if (!steers(meeting, data.presenceUserId)) {
+            ack({ ok: false, error: "NOT_HOST" });
+            return;
+          }
+        }
         const key = raisedHandsKey(data.presenceOrgId, meetingId);
-        const at = now();
+        const t = now();
+        let raisedAt: number;
         try {
-          if (raised) {
-            await redis.hset(key, data.presenceUserId, JSON.stringify({ socketId: socket.id, at }));
-            await redis.pexpire(key, HASH_TTL_MS);
+          if (intent.raised) {
+            // A second raise (another tab, a retry) keeps the place in the queue.
+            const kept = (await redis.eval(
+              RAISE_HAND,
+              1,
+              key,
+              intent.target,
+              JSON.stringify({ socketId: socket.id, at: t }),
+              socket.id,
+              String(HASH_TTL_MS),
+            )) as string;
+            raisedAt = parseHand(kept)?.at ?? t;
           } else {
-            await redis.hdel(key, data.presenceUserId);
+            const prev = parseHand(await redis.hget(key, intent.target));
+            const removed = await redis.hdel(key, intent.target);
+            if (removed === 0) {
+              // Already down: nothing to tell the room.
+              ack({ ok: true, changed: false });
+              return;
+            }
+            raisedAt = prev?.at ?? t;
           }
         } catch (err) {
           logger.error({ err, meetingId }, "raise hand failed");
@@ -459,9 +621,16 @@ export function createRoomEvents(deps: RoomEventsDeps) {
         }
         room(data, meetingId).emit("hand", {
           meetingId,
-          payload: { userId: data.presenceUserId, raised, at: new Date(at).toISOString() },
+          payload: {
+            userId: intent.target,
+            raised: intent.raised,
+            at: iso(intent.raised ? raisedAt : t),
+            raisedAt: iso(raisedAt),
+            byUserId: data.presenceUserId,
+            reason: intent.reason,
+          },
         });
-        ack({ ok: true });
+        ack({ ok: true, raisedAt: iso(raisedAt) });
       },
     );
 
@@ -569,6 +738,18 @@ export function createRoomEvents(deps: RoomEventsDeps) {
   async function sendRoomState(socket: Socket, meetingId: string): Promise<void> {
     const data = socket.data as RoomSocketData;
     try {
+      // Back after a drop: a hand still up is this socket's now, its place in the queue kept.
+      await redis.eval(
+        REBIND_HAND,
+        1,
+        raisedHandsKey(data.presenceOrgId, meetingId),
+        data.presenceUserId,
+        socket.id,
+      );
+    } catch (err) {
+      logger.error({ err, meetingId }, "hand rebind failed");
+    }
+    try {
       const [rawLocks, rawHands] = await Promise.all([
         redis.hgetall(candidateLocksKey(data.presenceOrgId, meetingId)),
         redis.hgetall(raisedHandsKey(data.presenceOrgId, meetingId)),
@@ -623,22 +804,52 @@ export function createRoomEvents(deps: RoomEventsDeps) {
     }
     try {
       const key = raisedHandsKey(data.presenceOrgId, meetingId);
-      const raw = await redis.hget(key, data.presenceUserId);
-      if (raw && (JSON.parse(raw) as { socketId?: string }).socketId === socketId) {
-        await redis.hdel(key, data.presenceUserId);
-        room(data, meetingId).emit("hand", {
-          meetingId,
-          payload: {
-            userId: data.presenceUserId,
-            raised: false,
-            at: new Date(now()).toISOString(),
-          },
-        });
+      const held = parseHand(await redis.hget(key, data.presenceUserId));
+      if (held?.socketId === socketId && stopped) {
+        // Shutting down: no timer outlives the pod; the hash's TTL tidies up.
+      } else if (held?.socketId === socketId) {
+        // A short drop keeps the hand: lower it only if they have not re-joined by then.
+        const timer = setTimeout(() => {
+          graceTimers.delete(timer);
+          void lowerIfStillGone(data, socketId, meetingId);
+        }, handGraceMs);
+        timer.unref?.();
+        graceTimers.add(timer);
       }
     } catch (err) {
       logger.error({ err, meetingId }, "hand release on disconnect failed");
     }
   }
 
-  return { attach, sendRoomState, releaseOnDisconnect };
+  async function lowerIfStillGone(data: RoomSocketData, socketId: string, meetingId: string) {
+    try {
+      const key = raisedHandsKey(data.presenceOrgId, meetingId);
+      const held = parseHand(await redis.hget(key, data.presenceUserId));
+      const dropped = await redis.eval(DROP_HAND_IF, 1, key, data.presenceUserId, socketId);
+      if (dropped !== 1) return;
+      const t = now();
+      room(data, meetingId).emit("hand", {
+        meetingId,
+        payload: {
+          userId: data.presenceUserId,
+          raised: false,
+          at: iso(t),
+          raisedAt: iso(held?.at ?? t),
+          byUserId: data.presenceUserId,
+          reason: "left",
+        },
+      });
+    } catch (err) {
+      logger.error({ err, meetingId }, "hand release after grace failed");
+    }
+  }
+
+  /** Stops pending hand-release timers (shutdown). */
+  function stop(): void {
+    stopped = true;
+    for (const timer of graceTimers) clearTimeout(timer);
+    graceTimers.clear();
+  }
+
+  return { attach, sendRoomState, releaseOnDisconnect, stop };
 }

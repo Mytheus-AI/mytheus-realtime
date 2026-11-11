@@ -304,6 +304,8 @@ export interface AppConfig {
   deltaShedPackets?: number;
   /** Shed an "agent-delta" when the WebSocket has this many unsent bytes. Default 256 KiB. */
   deltaShedBytes?: number;
+  /** How long a raised hand waits for its owner to re-join after a drop. Default 15 s. */
+  handGraceMs?: number;
 }
 
 export interface AppDeps {
@@ -408,6 +410,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     coreApi: coreApiClient,
     verifier: deps.jwtVerifier,
     logger,
+    handGraceMs: config.handGraceMs,
   });
   // Off the record and live caption translation (privacy.ts).
   const privacy = createPrivacy({ nsp, redis: pubClient, coreApi: coreApiClient, logger });
@@ -903,6 +906,7 @@ export function createApp(config: AppConfig, deps: AppDeps): App {
     },
     async stop() {
       clearInterval(sweepTimer);
+      roomEvents.stop();
       await agentOutputConsumer?.stop();
       await io.close();
       // `io.close()`'s own callback does not wait for each socket's async `disconnect` handler
