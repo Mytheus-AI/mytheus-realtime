@@ -49,6 +49,21 @@ function clerkOrgIdFromAuthHeader(authHeader: string | undefined): string | null
   }
 }
 
+/** Decodes (without verifying) the `sub` claim, as `clerkOrgIdFromAuthHeader` does `org_id`. */
+function clerkUserIdFromAuthHeader(authHeader: string | undefined): string | null {
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : undefined;
+  const payloadSegment = token?.split(".")[1];
+  if (!payloadSegment) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(payloadSegment, "base64url").toString("utf8")) as {
+      sub?: unknown;
+    };
+    return typeof claims.sub === "string" ? claims.sub : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface RecordedChatCall {
   orgId: string | null;
   meetingId: string;
@@ -109,6 +124,12 @@ export interface FakeCoreApi {
   setMeeting(row: FakeMeeting): void;
   /** Serve `{ incoming }` from `GET /api/v1/meetings/:id/resume-point` (unset = 404). */
   setResumePoint(meetingId: string, incoming: { id: string; status: string } | null): void;
+  /** Serve `GET /api/v1/listening/whoami` for this Clerk identity (In every meeting at once). */
+  setIdentity(
+    clerkOrgId: string,
+    clerkUserId: string,
+    resolved: { userId: string; orgId: string },
+  ): void;
   /** Make `POST /api/v1/chat` fail with this status (null = succeed). */
   failChatWith: number | null;
   close(): Promise<void>;
@@ -141,10 +162,21 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
   const candidates = new Map<string, FakeCandidate>();
   const meetings = new Map<string, FakeMeeting>();
   const resumePoints = new Map<string, { id: string; status: string } | null>();
+  const identities = new Map<string, { userId: string; orgId: string }>();
   const state = { failChatWith: null as number | null };
 
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? "", "http://localhost");
+
+    if (req.method === "GET" && url.pathname === "/api/v1/listening/whoami") {
+      const key = `${String(clerkOrgIdFromAuthHeader(req.headers.authorization))}:${String(
+        clerkUserIdFromAuthHeader(req.headers.authorization),
+      )}`;
+      const me = identities.get(key);
+      res.writeHead(me ? 200 : 404, { "content-type": "application/json" });
+      res.end(me ? JSON.stringify({ user_id: me.userId, org_id: me.orgId }) : "{}");
+      return;
+    }
 
     if (req.method === "GET") {
       const cand = /^\/api\/v1\/meetings\/([^/]+)\/candidates\/([^/]+)$/.exec(url.pathname);
@@ -248,6 +280,9 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
     },
     setResumePoint(meetingId, incoming) {
       resumePoints.set(meetingId, incoming);
+    },
+    setIdentity(clerkOrgId, clerkUserId, resolved) {
+      identities.set(`${clerkOrgId}:${clerkUserId}`, resolved);
     },
     get failChatWith() {
       return state.failChatWith;

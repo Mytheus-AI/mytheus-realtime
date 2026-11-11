@@ -38,6 +38,17 @@ export function pubsubChannel(orgId: string, meetingId: string): string {
 }
 
 /**
+ * A person's own fan-out channel: `nexus:{org_id}:pubsub:user:{user_id}` ("In every meeting at
+ * once"). core-api publishes to it when the person's agent interrupts them about a live meeting
+ * they are not in (`agent-interrupt`) and when a host shares or sets aside their view
+ * (`view-status`). Every gateway pod holding a socket of that person that asked to `listen` is
+ * subscribed; the channel, not the message body, decides who gets it. Internal UUIDs only.
+ */
+export function userChannel(orgId: string, userId: string): string {
+  return `nexus:${orgId}:pubsub:user:${userId}`;
+}
+
+/**
  * Verbatim canonical live presence set key: `nexus:{org_id}:presence:{meeting_id}`
  * (_canon/02-data-model.md §5). Ephemeral only — Redis is the only store, never a durable table.
  */
