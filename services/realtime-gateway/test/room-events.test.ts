@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 import type { Socket as ClientSocket } from "socket.io-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { verifyResolution } from "../src/roomEvents";
+import { handIntent, parseHand, verifyResolution } from "../src/roomEvents";
 import type { JoinAck } from "../src/server";
 import { connectClient, startTestApp, type TestApp } from "./helpers/testApp";
 
@@ -60,11 +60,78 @@ describe("verifyResolution (pure)", () => {
   });
 });
 
+describe("handIntent (pure)", () => {
+  const me = "u-me";
+  it("lets anyone raise and lower their own hand, lowering as they start to speak", () => {
+    expect(handIntent({ raised: true }, me)).toEqual({
+      ok: true,
+      target: me,
+      raised: true,
+      reason: "raised",
+      forOther: false,
+    });
+    expect(handIntent({ raised: false }, me)).toMatchObject({ ok: true, reason: "lowered" });
+    expect(handIntent({ raised: false, reason: "spoke" }, me)).toMatchObject({
+      ok: true,
+      reason: "spoke",
+    });
+    expect(handIntent({ raised: false, userId: me, reason: "lowered" }, me)).toMatchObject({
+      ok: true,
+      forOther: false,
+    });
+  });
+  it("lets someone else's hand only come down, as lowered or called on", () => {
+    expect(handIntent({ raised: false, userId: "u-raj" }, me)).toEqual({
+      ok: true,
+      target: "u-raj",
+      raised: false,
+      reason: "lowered",
+      forOther: true,
+    });
+    expect(handIntent({ raised: false, userId: "u-raj", reason: "called" }, me)).toMatchObject({
+      ok: true,
+      reason: "called",
+    });
+    expect(handIntent({ raised: true, userId: "u-raj" }, me)).toEqual({
+      ok: false,
+      error: "INVALID_PAYLOAD",
+    });
+    expect(handIntent({ raised: false, userId: "u-raj", reason: "spoke" }, me)).toEqual({
+      ok: false,
+      error: "INVALID_PAYLOAD",
+    });
+  });
+  it("refuses malformed requests", () => {
+    expect(handIntent({}, me)).toEqual({ ok: false, error: "INVALID_PAYLOAD" });
+    expect(handIntent({ raised: "yes" }, me)).toEqual({ ok: false, error: "INVALID_PAYLOAD" });
+    expect(handIntent({ raised: false, userId: "../x" }, me)).toEqual({
+      ok: false,
+      error: "INVALID_PAYLOAD",
+    });
+    expect(handIntent({ raised: false, reason: "called" }, me)).toEqual({
+      ok: false,
+      error: "INVALID_PAYLOAD",
+    });
+    expect(handIntent({ raised: true, reason: "lowered" }, me)).toEqual({
+      ok: false,
+      error: "INVALID_PAYLOAD",
+    });
+  });
+  it("reads a stored hand, ignoring junk", () => {
+    expect(parseHand(JSON.stringify({ socketId: "s1", at: 5 }))).toEqual({ socketId: "s1", at: 5 });
+    expect(parseHand("{bad")).toBeNull();
+    expect(parseHand(JSON.stringify({ at: "5" }))).toBeNull();
+    expect(parseHand(null)).toBeNull();
+  });
+});
+
+const HAND_GRACE_TEST_MS = 300;
+
 describe("room-wide events", () => {
   let t: TestApp;
 
   beforeAll(async () => {
-    t = await startTestApp();
+    t = await startTestApp({ handGraceMs: HAND_GRACE_TEST_MS });
   });
 
   afterAll(async () => {
@@ -364,6 +431,54 @@ describe("room-wide events", () => {
     m.rajSocket.close();
   });
 
+  it("announces a whole replaced agenda from the host, as stored, even before anyone set a status", async () => {
+    const m = await meeting();
+    const a = { id: randomUUID(), title: "Intro", status: "pending", position: 1 };
+    const b = { id: randomUUID(), title: "Budget", status: "pending", position: 0 };
+    t.coreApi.setMeeting({
+      id: m.meetingId,
+      status: "live",
+      host_user_id: m.maya.id,
+      created_by: m.maya.id,
+      agenda: [a, b],
+    });
+    const onRaj = collect(m.rajSocket, "agenda-status");
+    // Without `replaced`, items nobody has set are not announced.
+    expect(
+      await emitAck(m.mayaSocket, "agenda-status", {
+        meetingId: m.meetingId,
+        itemIds: [a.id, b.id],
+      }),
+    ).toEqual({ ok: false, error: "NOT_VERIFIED" });
+    expect(
+      await emitAck(m.rajSocket, "agenda-status", {
+        meetingId: m.meetingId,
+        itemIds: [a.id, b.id],
+        replaced: true,
+      }),
+    ).toEqual({ ok: false, error: "NOT_HOST" });
+    expect(
+      await emitAck(m.mayaSocket, "agenda-status", {
+        meetingId: m.meetingId,
+        itemIds: [a.id, randomUUID()],
+        replaced: true,
+      }),
+    ).toEqual({ ok: false, error: "NOT_VERIFIED" });
+    expect(
+      await emitAck(m.mayaSocket, "agenda-status", {
+        meetingId: m.meetingId,
+        itemIds: [a.id, b.id],
+        replaced: true,
+      }),
+    ).toEqual({ ok: true });
+    await waitFor(() => onRaj.length === 1);
+    expect(onRaj[0]).toMatchObject({
+      payload: { replaced: true, items: [b, a], byUserId: m.maya.id },
+    });
+    m.mayaSocket.close();
+    m.rajSocket.close();
+  });
+
   it("tells the room about the host's wrap-up from the stored row, with one deadline", async () => {
     const m = await meeting();
     const onRaj = collect(m.rajSocket, "wrap-up");
@@ -458,16 +573,137 @@ describe("room-wide events", () => {
     const m = await meeting();
     const onMaya = collect(m.mayaSocket, "hand");
 
-    expect(await emitAck(m.rajSocket, "hand", { meetingId: m.meetingId, raised: true })).toEqual({
+    expect(
+      await emitAck(m.rajSocket, "hand", { meetingId: m.meetingId, raised: true }),
+    ).toMatchObject({
       ok: true,
     });
     await waitFor(() => onMaya.length === 1);
-    expect(onMaya[0]).toMatchObject({ payload: { userId: m.raj.id, raised: true } });
+    expect(onMaya[0]).toMatchObject({
+      payload: { userId: m.raj.id, raised: true, byUserId: m.raj.id, reason: "raised" },
+    });
 
     m.rajSocket.close();
+    // Not at once: a short drop keeps the hand for the grace period.
+    await sleep(HAND_GRACE_TEST_MS / 3);
+    expect(onMaya.length).toBe(1);
     await waitFor(() => onMaya.length === 2);
-    expect(onMaya[1]).toMatchObject({ payload: { userId: m.raj.id, raised: false } });
+    expect(onMaya[1]).toMatchObject({
+      payload: { userId: m.raj.id, raised: false, reason: "left" },
+    });
     m.mayaSocket.close();
+  });
+
+  it("keeps a hand's place in the queue on a second raise and across a quick re-join", async () => {
+    const m = await meeting();
+    const first = await emitAck(m.rajSocket, "hand", { meetingId: m.meetingId, raised: true });
+    await sleep(30);
+    const again = await emitAck(m.rajSocket, "hand", { meetingId: m.meetingId, raised: true });
+    expect(again.raisedAt).toBe(first.raisedAt);
+
+    // Maya raises after Raj: the room-state queue is oldest first.
+    await emitAck(m.mayaSocket, "hand", { meetingId: m.meetingId, raised: true });
+
+    // Raj drops and comes back within the grace period: still up, still first.
+    m.rajSocket.close();
+    const back = await connectClient(
+      t.baseUrl,
+      await t.jwks.signToken({ orgId: m.orgId, userId: m.raj.clerk }),
+    );
+    const states = collect(back, "room-state");
+    await new Promise<JoinAck>((r) => back.emit("join", { meetingId: m.meetingId }, r));
+    await waitFor(() => states.length === 1);
+    const hands = (states[0] as { payload: { hands: Array<{ userId: string; at: string }> } })
+      .payload.hands;
+    expect(hands.map((h) => h.userId)).toEqual([m.raj.id, m.maya.id]);
+    expect(hands[0].at).toBe(first.raisedAt);
+
+    const onMaya = collect(m.mayaSocket, "hand");
+    await sleep(HAND_GRACE_TEST_MS + 150);
+    expect(
+      onMaya.filter((e) => (e as { payload: { raised: boolean } }).payload.raised === false),
+    ).toEqual([]);
+    back.close();
+    m.mayaSocket.close();
+  });
+
+  it("lets the host lower or call on someone's hand, and nobody else", async () => {
+    const m = await meeting();
+    const priya = { clerk: `user-${randomUUID()}`, id: randomUUID() };
+    t.coreApi.allowParticipant(m.orgId, m.meetingId, priya.clerk, { userId: priya.id });
+    const priyaSocket = await connectClient(
+      t.baseUrl,
+      await t.jwks.signToken({ orgId: m.orgId, userId: priya.clerk }),
+    );
+    await new Promise<JoinAck>((r) => priyaSocket.emit("join", { meetingId: m.meetingId }, r));
+    const onRaj = collect(m.rajSocket, "hand");
+    await emitAck(m.rajSocket, "hand", { meetingId: m.meetingId, raised: true });
+    await waitFor(() => onRaj.length === 1);
+
+    // Priya is not the host: she cannot lower Raj's hand.
+    expect(
+      await emitAck(priyaSocket, "hand", {
+        meetingId: m.meetingId,
+        raised: false,
+        userId: m.raj.id,
+      }),
+    ).toEqual({ ok: false, error: "NOT_HOST" });
+    // Nobody raises a hand for someone else.
+    expect(
+      await emitAck(m.mayaSocket, "hand", {
+        meetingId: m.meetingId,
+        raised: true,
+        userId: m.raj.id,
+      }),
+    ).toEqual({ ok: false, error: "INVALID_PAYLOAD" });
+
+    // Maya hosts: she calls on Raj, which lowers his hand for the room, attributed to her.
+    expect(
+      await emitAck(m.mayaSocket, "hand", {
+        meetingId: m.meetingId,
+        raised: false,
+        userId: m.raj.id,
+        reason: "called",
+      }),
+    ).toMatchObject({ ok: true });
+    await waitFor(() => onRaj.length === 2);
+    expect(onRaj[1]).toMatchObject({
+      payload: { userId: m.raj.id, raised: false, byUserId: m.maya.id, reason: "called" },
+    });
+
+    // Lowering a hand that is already down tells nobody.
+    expect(
+      await emitAck(m.mayaSocket, "hand", {
+        meetingId: m.meetingId,
+        raised: false,
+        userId: m.raj.id,
+      }),
+    ).toEqual({ ok: true, changed: false });
+    await sleep(80);
+    expect(onRaj.length).toBe(2);
+    priyaSocket.close();
+    m.mayaSocket.close();
+    m.rajSocket.close();
+  });
+
+  it("lowers your own hand as you start to speak, and says so", async () => {
+    const m = await meeting();
+    const onMaya = collect(m.mayaSocket, "hand");
+    await emitAck(m.rajSocket, "hand", { meetingId: m.meetingId, raised: true });
+    await waitFor(() => onMaya.length === 1);
+    expect(
+      await emitAck(m.rajSocket, "hand", {
+        meetingId: m.meetingId,
+        raised: false,
+        reason: "spoke",
+      }),
+    ).toMatchObject({ ok: true });
+    await waitFor(() => onMaya.length === 2);
+    expect(onMaya[1]).toMatchObject({
+      payload: { userId: m.raj.id, raised: false, byUserId: m.raj.id, reason: "spoke" },
+    });
+    m.mayaSocket.close();
+    m.rajSocket.close();
   });
 
   it("relays allowed reactions to the room, rate-limited per socket", async () => {
