@@ -140,3 +140,14 @@ export function offRecordKey(orgId: string, meetingId: string): string {
 export function captionLangsKey(orgId: string, meetingId: string): string {
   return `nexus:${orgId}:caption-langs:${meetingId}`;
 }
+
+/**
+ * "After the meeting" layer 1: the moments the room saw someone not get in (an unmute that was
+ * spoken over, a raised hand never called), one JSON string per signal:
+ * `nexus:{org_id}:room-signals:{meeting_id}`, a Redis LIST (newest 500, 48 h). Private: never
+ * broadcast. core-api reads it after the meeting ended and files it into `room_signals`
+ * (mytheus-backend `services/core_api/room_signals.py` `signals_key`, the same shape).
+ */
+export function roomSignalsKey(orgId: string, meetingId: string): string {
+  return `nexus:${orgId}:room-signals:${meetingId}`;
+}

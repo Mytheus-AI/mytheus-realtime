@@ -46,6 +46,13 @@
  *   "end-meeting"        ({ meetingId })                          after the host's PATCH succeeded
  *   "wrap-up"            ({ meetingId })                          after the host opened or
  *                                                                 cancelled the 60 s wrap-up
+ *   "floor-attempt"      ({ meetingId, startedAt, endedAt, overUserId?, unmutedAt? })
+ *                                                                 your unmute was spoken over
+ *                                                                 (epoch ms); kept privately for
+ *                                                                 the last word (roomSignals.ts),
+ *                                                                 never broadcast
+ *   "resume-point"       ({ meetingId, resumePointId })           after POST /resume-points/:id/
+ *                                                                 continue or dismiss succeeded
  *
  * Server -> client, to everyone in the meeting (`{ meetingId, payload }`):
  *   "candidate-resolution" { candidateId, kind, outcome, byUserId, at, row }
@@ -65,12 +72,21 @@
  *   "reaction"             { id, userId, reaction, at }
  *   "meeting-ended"        { byUserId, at }
  *   "wrap-up"              { state: "started" | "cancelled", startedAt, endsAt, byUserId, at }
+ *   "resume-point"         { id, status: "continued" | "dismissed", byUserId, at }
+ *                                                          only when core-api, read with the
+ *                                                          actor's token, holds this meeting's
+ *                                                          incoming point resolved
  * and to the joining socket only, right after a successful "join":
  *   "room-state"           { locks: [{ candidateId, byUserId, until }], hands: [{ userId, at }] }
  *                                                          hands oldest first: the queue
  *
  * A raised hand survives a short drop: when its socket goes, the hand is lowered only if that
  * person has not re-joined within HAND_GRACE_MS (a re-join takes the hand over, place kept).
+ *
+ * The last word ("After the meeting" layer 1): a hand that comes down without being called on
+ * (lowered by the host, given up after 30 s, dropped on leaving, still up at "End for everyone")
+ * and an unmute spoken over (`floor-attempt`) are kept privately on the meeting's room-signals
+ * list (roomSignals.ts). Keeping one never blocks or fails the event that caused it.
  */
 import { randomUUID } from "node:crypto";
 
@@ -81,6 +97,15 @@ import type { Namespace, Socket } from "socket.io";
 import type { ClerkJwtVerifier } from "../../../libs/auth";
 import { candidateLocksKey, raisedHandsKey, roomName } from "../../../libs/keys";
 import type { CoreApiClient, MeetingState } from "./coreApiClient";
+import {
+  FLOOR_MAX_PER_MEETING,
+  FLOOR_MIN_INTERVAL_MS,
+  floorAttemptEntry,
+  handEntry,
+  handOutcome,
+  recordSignals,
+  type SignalEntry,
+} from "./roomSignals";
 
 export const LOCK_TTL_MS = 90_000;
 /** A quiet meeting's lock and hand hashes disappear on their own after this long. */
@@ -125,6 +150,9 @@ export interface RoomSocketData {
   presenceOrgId: string;
   presenceUserId: string;
   lastReactionAt?: number;
+  /** `floor-attempt` rate limit: the last one and how many per meeting, on this socket. */
+  lastFloorAttemptAt?: number;
+  floorAttempts?: Map<string, number>;
 }
 
 export interface LockEntry {
@@ -351,6 +379,19 @@ export function createRoomEvents(deps: RoomEventsDeps) {
       socketId,
     );
     return released === 1;
+  }
+
+  /** Keep "didn't get in" signals for the last word; never throws, never blocks the caller. */
+  async function keep(
+    data: RoomSocketData,
+    meetingId: string,
+    entries: SignalEntry[],
+  ): Promise<void> {
+    try {
+      await recordSignals(redis, data.presenceOrgId, meetingId, entries);
+    } catch (err) {
+      logger.error({ err, meetingId }, "keeping room signals failed");
+    }
   }
 
   function attach(socket: Socket): void {
@@ -619,6 +660,10 @@ export function createRoomEvents(deps: RoomEventsDeps) {
           ack({ ok: false, error: "UNAVAILABLE" });
           return;
         }
+        if (!intent.raised) {
+          const outcome = handOutcome(intent.reason, intent.forOther, raisedAt, t);
+          if (outcome) void keep(data, meetingId, [handEntry(intent.target, outcome, raisedAt, t)]);
+        }
         room(data, meetingId).emit("hand", {
           meetingId,
           payload: {
@@ -689,6 +734,84 @@ export function createRoomEvents(deps: RoomEventsDeps) {
       ack({ ok: true, state: announced.state });
     });
 
+    socket.on(
+      "floor-attempt",
+      async (
+        payload: {
+          meetingId?: unknown;
+          startedAt?: unknown;
+          endedAt?: unknown;
+          overUserId?: unknown;
+          unmutedAt?: unknown;
+        },
+        rawAck?: unknown,
+      ) => {
+        const ack = safeAck(rawAck);
+        const meetingId = payload?.meetingId;
+        if (!joined(data, meetingId, ack)) return;
+        const t = now();
+        const counts = (data.floorAttempts ??= new Map<string, number>());
+        if (
+          (data.lastFloorAttemptAt !== undefined &&
+            t - data.lastFloorAttemptAt < FLOOR_MIN_INTERVAL_MS) ||
+          (counts.get(meetingId) ?? 0) >= FLOOR_MAX_PER_MEETING
+        ) {
+          ack({ ok: false, error: "RATE_LIMITED" });
+          return;
+        }
+        const entry = floorAttemptEntry(payload ?? {}, data.presenceUserId, t);
+        if (!entry) {
+          ack({ ok: false, error: "INVALID_PAYLOAD" });
+          return;
+        }
+        data.lastFloorAttemptAt = t;
+        counts.set(meetingId, (counts.get(meetingId) ?? 0) + 1);
+        try {
+          await recordSignals(redis, data.presenceOrgId, meetingId, [entry]);
+        } catch (err) {
+          logger.error({ err, meetingId }, "keeping a floor attempt failed");
+          ack({ ok: false, error: "UNAVAILABLE" });
+          return;
+        }
+        ack({ ok: true });
+      },
+    );
+
+    socket.on(
+      "resume-point",
+      async (payload: { meetingId?: unknown; resumePointId?: unknown }, rawAck?: unknown) => {
+        const ack = safeAck(rawAck);
+        const { meetingId, resumePointId } = payload ?? {};
+        if (!joined(data, meetingId, ack)) return;
+        if (!isId(resumePointId)) {
+          ack({ ok: false, error: "INVALID_PAYLOAD" });
+          return;
+        }
+        // The stored point decides what the room hears: only this meeting's incoming point, and
+        // only once core-api holds it continued or set aside.
+        const read = await coreApi.getResumePoint({ meetingId, bearerToken: data.bearerToken });
+        const point = read?.incoming;
+        if (
+          !point ||
+          point.id !== resumePointId ||
+          (point.status !== "continued" && point.status !== "dismissed")
+        ) {
+          ack({ ok: false, error: "NOT_VERIFIED" });
+          return;
+        }
+        room(data, meetingId).emit("resume-point", {
+          meetingId,
+          payload: {
+            id: point.id,
+            status: point.status,
+            byUserId: data.presenceUserId,
+            at: iso(now()),
+          },
+        });
+        ack({ ok: true, status: point.status });
+      },
+    );
+
     socket.on("end-meeting", async (payload: { meetingId?: unknown }, rawAck?: unknown) => {
       const ack = safeAck(rawAck);
       const meetingId = payload?.meetingId;
@@ -701,6 +824,17 @@ export function createRoomEvents(deps: RoomEventsDeps) {
       if (!steers(meeting, data.presenceUserId)) {
         ack({ ok: false, error: "NOT_HOST" });
         return;
+      }
+      try {
+        const t = now();
+        const up = await redis.hgetall(raisedHandsKey(data.presenceOrgId, meetingId));
+        const entries = Object.entries(up).flatMap(([userId, raw]) => {
+          const hand = parseHand(raw);
+          return hand ? [handEntry(userId, "still_raised_at_end", hand.at, t)] : [];
+        });
+        await keep(data, meetingId, entries);
+      } catch (err) {
+        logger.error({ err, meetingId }, "reading raised hands on end failed");
       }
       try {
         await redis.del(
@@ -828,6 +962,7 @@ export function createRoomEvents(deps: RoomEventsDeps) {
       const dropped = await redis.eval(DROP_HAND_IF, 1, key, data.presenceUserId, socketId);
       if (dropped !== 1) return;
       const t = now();
+      if (held) void keep(data, meetingId, [handEntry(data.presenceUserId, "left", held.at, t)]);
       room(data, meetingId).emit("hand", {
         meetingId,
         payload: {

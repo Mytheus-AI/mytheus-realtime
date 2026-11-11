@@ -107,6 +107,8 @@ export interface FakeCoreApi {
   setCandidate(row: FakeCandidate): void;
   /** Serve this meeting from `GET /api/v1/meetings/:id`. */
   setMeeting(row: FakeMeeting): void;
+  /** Serve `{ incoming }` from `GET /api/v1/meetings/:id/resume-point` (unset = 404). */
+  setResumePoint(meetingId: string, incoming: { id: string; status: string } | null): void;
   /** Make `POST /api/v1/chat` fail with this status (null = succeed). */
   failChatWith: number | null;
   close(): Promise<void>;
@@ -138,6 +140,7 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
 
   const candidates = new Map<string, FakeCandidate>();
   const meetings = new Map<string, FakeMeeting>();
+  const resumePoints = new Map<string, { id: string; status: string } | null>();
   const state = { failChatWith: null as number | null };
 
   const server: Server = createServer((req, res) => {
@@ -149,6 +152,15 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
         const row = candidates.get(`${cand[1]}:${cand[2]}`);
         res.writeHead(row ? 200 : 404, { "content-type": "application/json" });
         res.end(row ? JSON.stringify(row) : "{}");
+        return;
+      }
+      const resume = /^\/api\/v1\/meetings\/([^/]+)\/resume-point$/.exec(url.pathname);
+      if (resume) {
+        const known = resumePoints.has(resume[1]);
+        res.writeHead(known ? 200 : 404, { "content-type": "application/json" });
+        res.end(
+          known ? JSON.stringify({ incoming: resumePoints.get(resume[1]), saved: null }) : "{}",
+        );
         return;
       }
       const meeting = /^\/api\/v1\/meetings\/([^/]+)$/.exec(url.pathname);
@@ -233,6 +245,9 @@ export async function startFakeCoreApi(): Promise<FakeCoreApi> {
     },
     setMeeting(row) {
       meetings.set(row.id, row);
+    },
+    setResumePoint(meetingId, incoming) {
+      resumePoints.set(meetingId, incoming);
     },
     get failChatWith() {
       return state.failChatWith;

@@ -86,6 +86,13 @@ export interface CandidateState {
   confirmed_by?: string | null;
 }
 
+/** The incoming resume point of a meeting (`GET /api/v1/meetings/:id/resume-point`), as far as the
+ * gateway needs it to verify a `resume-point` announcement. */
+export interface IncomingResumePoint {
+  id: string;
+  status: string;
+}
+
 /** The fields of core-api's `MeetingDetail` this gateway reads to verify a host action. */
 export interface MeetingState {
   id: string;
@@ -138,6 +145,9 @@ export interface CoreApiClient {
   /** The meeting (status, host, creator, agenda, wrap-up), read with the actor's token. Null on
    * failure. */
   getMeeting(params: CoreReadParams): Promise<MeetingState | null>;
+  /** The thread this meeting picks up ("pick up where we stopped"), read with the actor's
+   * token: `{ incoming }` (null when there is none), or null on any failure. */
+  getResumePoint(params: CoreReadParams): Promise<{ incoming: IncomingResumePoint | null } | null>;
 }
 
 export interface CoreApiClientOptions {
@@ -206,6 +216,24 @@ export function createCoreApiClient(options: CoreApiClientOptions): CoreApiClien
         return body as CandidateState;
       } catch (err) {
         options.logger?.warn({ err, meetingId, candidateId }, "core-api candidate read failed");
+        return null;
+      }
+    },
+
+    async getResumePoint({ meetingId, bearerToken }) {
+      try {
+        const res = await fetchFn(
+          `${options.baseUrl}/api/v1/meetings/${encodeURIComponent(meetingId)}/resume-point`,
+          { headers: { Authorization: `Bearer ${bearerToken}` } },
+        );
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as { incoming?: Partial<IncomingResumePoint> | null };
+        const inc = body?.incoming;
+        if (inc === null || inc === undefined) return { incoming: null };
+        if (typeof inc.id !== "string" || typeof inc.status !== "string") return null;
+        return { incoming: { id: inc.id, status: inc.status } };
+      } catch (err) {
+        options.logger?.warn({ err, meetingId }, "core-api resume point read failed");
         return null;
       }
     },
