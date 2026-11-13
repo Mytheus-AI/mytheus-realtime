@@ -14,8 +14,8 @@
  *    a host agenda change and "End for everyone" are announced only after this gateway re-reads
  *    the stored fact from core-api WITH THE ACTOR'S OWN TOKEN and finds it matches: a confirm is
  *    announced only if core-api holds it confirmed BY THIS PERSON, a dismissal for everyone only if
- *    it is dismissed and this person hosts or created the meeting, an agenda change only if the
- *    item is host-set, an end only if the meeting is ended. The broadcast carries the stored row,
+ *    it is dismissed and this person hosts or created the meeting or is the person the task is
+ *    for, an agenda change only if the item is host-set, an end only if the meeting is ended. The broadcast carries the stored row,
  *    so a client cannot put words in it either. The write itself stays a core-api REST call
  *    (core-api remains the only writer); this is the fan-out of a fact already committed.
  *
@@ -242,10 +242,11 @@ export function steers(meeting: MeetingState, internalUserId: string): boolean {
 /**
  * Whether the stored candidate supports the announcement. Pure, so it is tested on its own.
  * `actorSteers` is only consulted for a dismissal: a dismissal is announced to the room only when
- * the host (or creator) made it; anyone else's "Hide for me" never reaches the gateway at all.
+ * someone core-api lets dismiss the card made it: the person a task is for (they declined it), or
+ * the host (or creator). Anyone else's "Hide for me" never reaches the gateway at all.
  */
 export function verifyResolution(
-  row: { status: string; confirmed_by?: string | null },
+  row: { status: string; confirmed_by?: string | null; assignee_id?: string | null },
   outcome: CandidateOutcome,
   actorUserId: string,
   actorSteers: boolean,
@@ -255,7 +256,9 @@ export function verifyResolution(
   }
   if (outcome === "edited") return row.status === "proposed" ? "ok" : "NOT_VERIFIED";
   if (row.status !== "dismissed") return "NOT_VERIFIED";
-  return actorSteers ? "ok" : "NOT_HOST";
+  return actorSteers || (row.assignee_id != null && row.assignee_id === actorUserId)
+    ? "ok"
+    : "NOT_HOST";
 }
 
 export function parseLock(raw: string | null | undefined): LockEntry | null {

@@ -53,9 +53,15 @@ describe("verifyResolution (pure)", () => {
     expect(verifyResolution({ status: "proposed" }, "edited", me, false)).toBe("ok");
     expect(verifyResolution({ status: "confirmed" }, "edited", me, false)).toBe("NOT_VERIFIED");
   });
-  it("announces a dismissal for everyone only from the host or creator", () => {
+  it("announces a dismissal for everyone only from the host, the creator or the task's owner", () => {
     expect(verifyResolution({ status: "dismissed" }, "dismissed", me, true)).toBe("ok");
     expect(verifyResolution({ status: "dismissed" }, "dismissed", me, false)).toBe("NOT_HOST");
+    expect(verifyResolution({ status: "dismissed", assignee_id: me }, "dismissed", me, false)).toBe(
+      "ok",
+    );
+    expect(
+      verifyResolution({ status: "dismissed", assignee_id: "other" }, "dismissed", me, false),
+    ).toBe("NOT_HOST");
     expect(verifyResolution({ status: "proposed" }, "dismissed", me, true)).toBe("NOT_VERIFIED");
   });
 });
