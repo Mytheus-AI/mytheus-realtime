@@ -16,7 +16,10 @@ from transcription_service.providers.base import Utterance
 
 @pytest.mark.asyncio
 async def test_redelivered_final_does_not_double_write(
-    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    redis_client,
+    tenant: dict[str, str],
 ) -> None:
     org_id, meeting_id = tenant["org_id"], tenant["meeting_id"]
     chunk_id = str(uuid.uuid4())
@@ -50,7 +53,7 @@ async def test_redelivered_final_does_not_double_write(
     assert first is not None
     assert second is None, "a redelivered final must be a no-op, not a second write"
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         chunk_count = (
             await session.execute(
                 text(

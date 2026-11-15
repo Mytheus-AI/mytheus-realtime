@@ -21,16 +21,70 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from transcription_service.db import make_engine, make_session_factory
 
-TEST_DATABASE_URL = os.environ.get(
-    "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5443/mytheus"
+# Two URLs on purpose (the same split mytheus-backend's suite runs). The SCHEMA OWNER seeds
+# cross-tenant fixtures; the SERVICE ROLE is what the code under test connects as. Before journal
+# plan Part 3 fix 4 both were `postgres`, which bypasses RLS on supabase/postgres, so no test here
+# could see a missing `app.current_org` or a missing grant.
+TEST_BOOTSTRAP_DATABASE_URL = os.environ.get(
+    "TEST_BOOTSTRAP_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5443/mytheus"
 )
+SERVICE_ROLE = "mytheus_transcription"
+
+
+def role_url(role: str, password: str | None = None) -> str:
+    """The owner URL with another role's credentials (dev/test password = the role name)."""
+    scheme, _, rest = TEST_BOOTSTRAP_DATABASE_URL.partition("://")
+    return f"{scheme}://{role}:{password or role}@{rest.rpartition('@')[2]}"
+
+
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or role_url(SERVICE_ROLE)
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6390")
 TEST_REDPANDA_BROKERS = os.environ.get("TEST_REDPANDA_BROKERS", "localhost:9092")
 TEST_SCHEMA_REGISTRY_URL = os.environ.get("TEST_SCHEMA_REGISTRY_URL", "http://localhost:8085")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _service_role_can_log_in() -> None:
+    """The migration creates `mytheus_transcription` NOLOGIN with no password (a password in a
+    migration is a password in git). Tests give it the dev password, like mytheus-backend's
+    conftest does for its roles."""
+    import asyncio
+
+    async def _set() -> None:
+        eng = make_engine(TEST_BOOTSTRAP_DATABASE_URL, allow_privileged=True)
+        try:
+            async with eng.begin() as conn:
+                await conn.execute(
+                    text(f"ALTER ROLE {SERVICE_ROLE} WITH LOGIN PASSWORD '{SERVICE_ROLE}'")
+                )
+        finally:
+            await eng.dispose()
+
+    try:
+        asyncio.run(_set())
+    except Exception:  # noqa: BLE001 - no database: the DB tests fail on their own, loudly
+        pass
+
+
+@pytest_asyncio.fixture
+async def owner_engine() -> AsyncIterator[AsyncEngine]:
+    """The schema owner, for fixtures that seed or clean up rows across tenants. Never the
+    connection the code under test uses."""
+    eng = make_engine(TEST_BOOTSTRAP_DATABASE_URL, allow_privileged=True)
+    try:
+        yield eng
+    finally:
+        await eng.dispose()
+
+
+@pytest.fixture
+def owner_session_factory(owner_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    return make_session_factory(owner_engine)
+
+
 @pytest_asyncio.fixture
 async def engine() -> AsyncIterator[AsyncEngine]:
+    """The service role (`mytheus_transcription`), guarded exactly as in production."""
     # Function-scoped (not session-scoped): pytest-asyncio gives each async test its own
     # event loop by default, and an asyncpg connection pool bound to one loop breaks on the
     # next test's loop ("Task ... got Future ... attached to a different loop"). A fresh
@@ -58,7 +112,7 @@ async def redis_client() -> AsyncIterator[Redis]:
 
 @pytest_asyncio.fixture
 async def tenant(
-    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[dict[str, str]]:
     """A fresh `organizations` + `tenant_settings` + `data_residency` row set, so `outbox`'s
     FK to `organizations` and the RLS-protected reads in `tenancy.py` have something real to
@@ -66,7 +120,7 @@ async def tenant(
     needs a specific value (via direct UPDATE), defaulting here to `us` / redaction on."""
     org_id = str(uuid.uuid4())
     slug = f"test-{uuid.uuid4().hex[:12]}"
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await session.execute(
                 text("INSERT INTO organizations (id, name, slug) VALUES (:id, :name, :slug)"),
@@ -86,7 +140,7 @@ async def tenant(
     try:
         yield {"org_id": org_id, "meeting_id": str(uuid.uuid4())}
     finally:
-        async with session_factory() as session:
+        async with owner_session_factory() as session:
             async with session.begin():
                 await session.execute(
                     text("DELETE FROM transcript_chunks WHERE org_id = :org_id"), {"org_id": org_id}

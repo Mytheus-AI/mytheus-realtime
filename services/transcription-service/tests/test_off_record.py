@@ -122,6 +122,7 @@ async def _count(factory: async_sessionmaker[AsyncSession], sql: str, org_id: st
 
 async def test_off_record_final_is_not_persisted_or_produced(
     session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
     redis_client: Any,
     tenant: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -147,8 +148,8 @@ async def test_off_record_final_is_not_persisted_or_produced(
         assert result is None
         rows = "SELECT count(*) FROM transcript_chunks WHERE org_id = :o"
         outbox = "SELECT count(*) FROM outbox WHERE org_id = :o AND topic = 'transcript-chunks'"
-        assert await _count(session_factory, rows, org_id) == 0
-        assert await _count(session_factory, outbox, org_id) == 0
+        assert await _count(owner_session_factory, rows, org_id) == 0
+        assert await _count(owner_session_factory, outbox, org_id) == 0
 
         await redis_client.delete(key)
         result = await process_utterance(
@@ -160,8 +161,8 @@ async def test_off_record_final_is_not_persisted_or_produced(
             pii_redaction_enabled=False,
         )
         assert result is not None
-        assert await _count(session_factory, rows, org_id) == 1
-        assert await _count(session_factory, outbox, org_id) == 1
+        assert await _count(owner_session_factory, rows, org_id) == 1
+        assert await _count(owner_session_factory, outbox, org_id) == 1
         captions = []
         for _ in range(20):
             msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)

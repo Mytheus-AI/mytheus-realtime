@@ -18,14 +18,14 @@ import uuid
 from datetime import date
 
 import pytest
-from conftest import TEST_DATABASE_URL
+from conftest import role_url
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from transcription_service.db import make_session_factory, set_current_org
 
-APP_ROLE_DATABASE_URL = TEST_DATABASE_URL.replace("postgres:postgres@", "mytheus_app:mytheus_app@")
+APP_ROLE_DATABASE_URL = role_url("mytheus_app")
 
 
 @pytest.fixture
@@ -39,14 +39,14 @@ def app_role_session_factory(app_role_engine: AsyncEngine) -> async_sessionmaker
 
 
 @pytest.fixture
-async def two_tenants(session_factory):  # type: ignore[no-untyped-def]
+async def two_tenants(session_factory, owner_session_factory):  # type: ignore[no-untyped-def]
     """Two orgs, each with one `transcript_chunks` row, inserted as the `postgres` superuser
     (legitimate test-harness setup, same pattern `conftest.py`'s `tenant` fixture already
     uses) so the isolation assertions below have real cross-tenant data to fail to leak."""
     org_a, org_b = str(uuid.uuid4()), str(uuid.uuid4())
     meeting_a, meeting_b = str(uuid.uuid4()), str(uuid.uuid4())
     chunk_a, chunk_b = str(uuid.uuid4()), str(uuid.uuid4())
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             for org_id in (org_a, org_b):
                 await session.execute(
@@ -76,7 +76,7 @@ async def two_tenants(session_factory):  # type: ignore[no-untyped-def]
             "chunk_b": chunk_b,
         }
     finally:
-        async with session_factory() as session:
+        async with owner_session_factory() as session:
             async with session.begin():
                 for org_id in (org_a, org_b):
                     await session.execute(

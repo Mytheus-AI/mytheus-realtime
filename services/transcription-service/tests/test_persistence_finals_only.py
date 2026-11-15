@@ -23,8 +23,8 @@ from transcription_service.persistence import process_utterance
 from transcription_service.providers.base import Utterance
 
 
-async def _outbox_count(session_factory: async_sessionmaker[AsyncSession], org_id: str) -> int:
-    async with session_factory() as session:
+async def _outbox_count(factory: async_sessionmaker[AsyncSession], org_id: str) -> int:
+    async with factory() as session:
         result = await session.execute(
             text(
                 "SELECT count(*) FROM outbox WHERE org_id = :org_id AND topic = 'transcript-chunks'"
@@ -34,8 +34,8 @@ async def _outbox_count(session_factory: async_sessionmaker[AsyncSession], org_i
         return int(result.scalar_one())
 
 
-async def _chunk_count(session_factory: async_sessionmaker[AsyncSession], org_id: str) -> int:
-    async with session_factory() as session:
+async def _chunk_count(factory: async_sessionmaker[AsyncSession], org_id: str) -> int:
+    async with factory() as session:
         result = await session.execute(
             text("SELECT count(*) FROM transcript_chunks WHERE org_id = :org_id"),
             {"org_id": org_id},
@@ -45,7 +45,10 @@ async def _chunk_count(session_factory: async_sessionmaker[AsyncSession], org_id
 
 @pytest.mark.asyncio
 async def test_interims_zero_rows_zero_bus_messages_final_writes_exactly_one(
-    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    redis_client,
+    tenant: dict[str, str],
 ) -> None:
     org_id, meeting_id = tenant["org_id"], tenant["meeting_id"]
     chunk_id = str(uuid.uuid4())
@@ -91,12 +94,12 @@ async def test_interims_zero_rows_zero_bus_messages_final_writes_exactly_one(
         assert result is None, "an interim must never return a FinalWriteResult"
 
     # THE LOAD-BEARING ASSERTION, part 1: zero rows, zero bus messages after interims only.
-    assert await _chunk_count(session_factory, org_id) == 0
-    assert await _outbox_count(session_factory, org_id) == 0
+    assert await _chunk_count(owner_session_factory, org_id) == 0
+    assert await _outbox_count(owner_session_factory, org_id) == 0
 
     # Drain the (empty) outbox against the REAL broker too -- proves there is nothing to
     # produce, not merely that we didn't look.
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             produced = await drain_outbox_for_org(
                 session,
@@ -118,10 +121,10 @@ async def test_interims_zero_rows_zero_bus_messages_final_writes_exactly_one(
     assert result is not None
     assert result.chunk_id == chunk_id
 
-    assert await _chunk_count(session_factory, org_id) == 1
-    assert await _outbox_count(session_factory, org_id) == 1
+    assert await _chunk_count(owner_session_factory, org_id) == 1
+    assert await _outbox_count(owner_session_factory, org_id) == 1
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         row = (
             (
                 await session.execute(
@@ -142,7 +145,7 @@ async def test_interims_zero_rows_zero_bus_messages_final_writes_exactly_one(
     assert row["is_final"] is True
     assert row["redacted"] is False  # no PII in this utterance
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         outbox_row = (
             (
                 await session.execute(
@@ -163,7 +166,7 @@ async def test_interims_zero_rows_zero_bus_messages_final_writes_exactly_one(
     assert outbox_row["schema_subject"] == "transcript-chunks-value"
 
     # --- Drain against the REAL broker and consume it back with a real consumer --------
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             produced = await drain_outbox_for_org(
                 session,

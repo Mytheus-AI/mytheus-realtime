@@ -14,10 +14,12 @@ from transcription_service.db import set_current_org
 
 @pytest.mark.asyncio
 async def test_record_session_decision_writes_redaction_and_region(
-    session_factory: async_sessionmaker[AsyncSession], tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    tenant: dict[str, str],
 ) -> None:
     org_id, meeting_id = tenant["org_id"], tenant["meeting_id"]
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             await record_session_decision(
@@ -28,7 +30,7 @@ async def test_record_session_decision_writes_redaction_and_region(
                 pii_redaction_enabled=True,
             )
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             row = (
@@ -55,7 +57,10 @@ async def test_record_session_decision_writes_redaction_and_region(
 
 @pytest.mark.asyncio
 async def test_session_open_writes_an_audit_entry(
-    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    redis_client,
+    tenant: dict[str, str],
 ) -> None:
     """End-to-end through `SessionTracker.on_participant_joined`, not just the direct
     `audit.py` unit above -- proves the wiring, not only the function."""
@@ -68,7 +73,7 @@ async def test_session_open_writes_an_audit_entry(
 
     await tracker.on_participant_joined(org_id=org_id, meeting_id=meeting_id)
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             count = (

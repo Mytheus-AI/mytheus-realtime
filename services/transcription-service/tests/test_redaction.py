@@ -78,6 +78,7 @@ def test_no_pii_passes_through_unredacted() -> None:
 )
 async def test_persisted_text_respects_tenant_flag(
     session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
     redis_client,
     tenant: dict[str, str],
     pii_redaction_enabled: bool,
@@ -107,7 +108,7 @@ async def test_persisted_text_respects_tenant_flag(
     assert result is not None
     assert result.redacted is expected_redacted
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         row = (
             (
                 await session.execute(
