@@ -19,6 +19,9 @@ on:
   push:
     branches: [main]
 
+env:
+  UV_PYTHON: "3.12"
+
 jobs:
   gateway:
     runs-on: ubuntu-latest
