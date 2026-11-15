@@ -15,15 +15,17 @@ from transcription_service.tenancy import get_data_residency_region, get_pii_red
 
 @pytest.mark.asyncio
 async def test_pii_redaction_flag_read_from_tenant_settings(
-    session_factory: async_sessionmaker[AsyncSession], tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    tenant: dict[str, str],
 ) -> None:
     org_id = tenant["org_id"]
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             assert await get_pii_redaction_enabled(session, org_id) is True  # fixture default
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             await session.execute(
@@ -34,7 +36,7 @@ async def test_pii_redaction_flag_read_from_tenant_settings(
                 {"org_id": org_id},
             )
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             assert await get_pii_redaction_enabled(session, org_id) is False
@@ -42,16 +44,18 @@ async def test_pii_redaction_flag_read_from_tenant_settings(
 
 @pytest.mark.asyncio
 async def test_data_residency_region_read_and_endpoint_selection_us_and_eu(
-    session_factory: async_sessionmaker[AsyncSession], tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    tenant: dict[str, str],
 ) -> None:
     org_id = tenant["org_id"]
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             assert await get_data_residency_region(session, org_id) == "us"  # fixture default
     assert deepgram_endpoint_for_region("us") == "wss://api.deepgram.com/v1/listen"
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             await session.execute(
@@ -59,7 +63,7 @@ async def test_data_residency_region_read_and_endpoint_selection_us_and_eu(
                 {"org_id": org_id},
             )
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, org_id)
             region = await get_data_residency_region(session, org_id)
@@ -70,13 +74,14 @@ async def test_data_residency_region_read_and_endpoint_selection_us_and_eu(
 @pytest.mark.asyncio
 async def test_missing_rows_fail_safe(
     session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """No `tenant_settings`/`data_residency` row for an org (shouldn't happen in steady state,
     but must fail toward the SAFER default: redact by default, pin to `us`)."""
     import uuid
 
     unknown_org = str(uuid.uuid4())
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         async with session.begin():
             await set_current_org(session, unknown_org)
             assert await get_pii_redaction_enabled(session, unknown_org) is True

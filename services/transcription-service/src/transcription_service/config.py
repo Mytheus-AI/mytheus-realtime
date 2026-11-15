@@ -73,7 +73,10 @@ class Settings:
 def load_settings_from_env() -> Settings:
     return Settings(
         database_url=os.environ.get(
-            "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/mytheus"
+            # The least-privilege role (migration d8b4f2a6c0e1), never `postgres`: that role
+            # bypasses RLS on supabase/postgres and the pool guard refuses it.
+            "DATABASE_URL",
+            "postgresql+asyncpg://mytheus_transcription:mytheus_transcription@localhost:5443/mytheus",
         ),
         redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"),
         redpanda_brokers=os.environ.get("REDPANDA_BROKERS", "localhost:9092"),

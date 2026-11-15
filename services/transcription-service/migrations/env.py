@@ -44,8 +44,12 @@ VERSION_TABLE = "alembic_version_transcription_service"
 
 
 def _database_url() -> str:
-    return os.environ.get(
-        "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/mytheus"
+    # Migrations run as the schema owner. BOOTSTRAP_DATABASE_URL first, because DATABASE_URL
+    # names the service's least-privilege role, which holds no DDL privilege.
+    return (
+        os.environ.get("BOOTSTRAP_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+        or "postgresql+asyncpg://postgres:postgres@localhost:5432/mytheus"
     )
 
 

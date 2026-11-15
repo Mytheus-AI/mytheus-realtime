@@ -92,7 +92,10 @@ async def test_byte_identical_redelivery_yields_the_same_chunk_id() -> None:
 
 @pytest.mark.asyncio
 async def test_two_distinct_utterances_both_persist_and_a_redelivery_still_dedupes(
-    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    redis_client,
+    tenant: dict[str, str],
 ) -> None:
     """End-to-end through the real pipeline against real Postgres: proves the collision fix
     and the idempotency guarantee together, not just the key-derivation unit above."""
@@ -119,7 +122,7 @@ async def test_two_distinct_utterances_both_persist_and_a_redelivery_still_dedup
         )
         assert result is not None, "a genuinely distinct concurrent utterance must not be dropped"
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         rows = (
             (
                 await session.execute(
@@ -150,7 +153,7 @@ async def test_two_distinct_utterances_both_persist_and_a_redelivery_still_dedup
     )
     assert dedupe_result is None, "redelivery of an already-written final must be a no-op"
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         count = (
             await session.execute(
                 text(

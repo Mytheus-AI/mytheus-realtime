@@ -10,16 +10,14 @@ against the shared Postgres are the established pattern here; only cross-service
 table this service does not own are forbidden, and `outbox` is the one deliberate exception,
 being infrastructure every producer writes to by design). See `tenancy.py` and `outbox.py`.
 
-Local dev/test connects as the `postgres` superuser, unchanged from the existing scaffold's
-`.env.example` (`postgresql+asyncpg://postgres:postgres@localhost:5432/mytheus`) — see
-`work-done-till-now` for why a properly scoped least-privilege role for this service
-(mirroring `mytheus_app`/`mytheus_relay`) is deferred: `mytheus-backend`'s own roles
-(`mytheus_app`, `mytheus_relay`, `mytheus_admin`) are created with NO PASSWORD by design
-(`a1c4e7f20b18`'s docstring: "cannot authenticate until an operator sets it"), and granting a
-new cross-repo role SELECT on tables this service does not own is an ops/bootstrap concern,
-not something a migration in THIS repo should silently arrogate. The `SET LOCAL
-app.current_org` calls below are still always issued, so the code is correct for a properly
-scoped role in production even though the local superuser connection bypasses RLS.
+The service connects as `mytheus_transcription` (migration `d8b4f2a6c0e1`): no superuser, no
+BYPASSRLS, no predefined-role membership, and grants on exactly the tables and columns its SQL
+touches. That is the default in code (`config.py`), in `.env.example` and in the test suite.
+It used to be `postgres`, which on supabase/postgres holds BYPASSRLS and `pg_read_all_data`, so
+every `tenant_isolation` policy was off for this service and its `SET LOCAL app.current_org`
+calls were decoration. `make_engine` installs the pool guard (`db_guard.py`): a connection as
+a role that would make RLS inert is refused before the pool hands it out. Only the schema
+owner's tooling (migrations, test fixtures that seed cross-tenant rows) opts out, explicitly.
 """
 
 from __future__ import annotations
@@ -35,9 +33,19 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from .db_guard import install_role_guard
 
-def make_engine(database_url: str) -> AsyncEngine:
-    return create_async_engine(database_url, pool_pre_ping=True)
+
+def make_engine(database_url: str, *, allow_privileged: bool = False) -> AsyncEngine:
+    """The service's engine, guarded so it can never run as a role that bypasses RLS.
+
+    `allow_privileged=True` is for the schema owner's own tooling only (test fixtures that seed
+    rows across tenants); the service never passes it.
+    """
+    engine = create_async_engine(database_url, pool_pre_ping=True)
+    if not allow_privileged:
+        install_role_guard(engine)
+    return engine
 
 
 def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

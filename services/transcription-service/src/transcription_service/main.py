@@ -56,6 +56,7 @@ from .capture_auth import secret_usable
 from .capture_in import CaptureHub, parse_allowed_origins
 from .config import load_settings_from_env
 from .db import make_engine, make_session_factory
+from .db_guard import verify_role
 from .erasure_consumer import run_consumer as run_erasure_consumer
 from .meeting_room_consumer import run_consumer
 from .providers.factory import select_provider
@@ -105,6 +106,8 @@ def _log_erasure_consumer_exit(task: asyncio.Task[None]) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = load_settings_from_env()
     engine = make_engine(settings.database_url)
+    # Refuse to start as a role that bypasses RLS (superuser, BYPASSRLS, pg_read_all_data...).
+    await verify_role(engine)
     session_factory = make_session_factory(engine)
     # `decode_responses=True` matches `tests/conftest.py`'s client, so the tested and the
     # running configuration cannot diverge. Nothing here reads a value back (the dedupe key is

@@ -130,9 +130,12 @@ def _event(
 
 
 @pytest_asyncio.fixture
-async def other_org(session_factory: async_sessionmaker[AsyncSession]) -> AsyncIterator[str]:
+async def other_org(
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[str]:
     org_id = str(uuid.uuid4())
-    async with session_factory() as session, session.begin():
+    async with owner_session_factory() as session, session.begin():
         await session.execute(
             text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Other', :slug)"),
             {"id": org_id, "slug": f"other-{uuid.uuid4().hex[:12]}"},
@@ -140,7 +143,7 @@ async def other_org(session_factory: async_sessionmaker[AsyncSession]) -> AsyncI
     try:
         yield org_id
     finally:
-        async with session_factory() as session, session.begin():
+        async with owner_session_factory() as session, session.begin():
             for table in ("transcript_chunks", "outbox"):
                 await session.execute(
                     text(f"DELETE FROM {table} WHERE org_id = :o"), {"o": org_id}  # noqa: S608
@@ -191,25 +194,25 @@ def _encodes_against_v2(value: dict[str, Any]) -> None:
 
 
 async def test_meeting_erasure_deletes_only_that_meetings_rows_and_records_completion(
-    session_factory, redis_client, tenant, other_org
+    session_factory, owner_session_factory, redis_client, tenant, other_org
 ):
     org, meeting = tenant["org_id"], tenant["meeting_id"]
     kept_meeting = str(uuid.uuid4())
-    await _chunk(session_factory, org, meeting, "1", "a erased line")
-    await _chunk(session_factory, org, meeting, str(uuid.uuid4()), "b erased line")
-    await _chunk(session_factory, org, kept_meeting, "1", "c other meeting")
-    await _chunk(session_factory, other_org, meeting, "1", "d other org, same meeting id")
+    await _chunk(owner_session_factory, org, meeting, "1", "a erased line")
+    await _chunk(owner_session_factory, org, meeting, str(uuid.uuid4()), "b erased line")
+    await _chunk(owner_session_factory, org, kept_meeting, "1", "c other meeting")
+    await _chunk(owner_session_factory, other_org, meeting, "1", "d other org, same meeting id")
 
     erasure_id = str(uuid.uuid4())
     event = _event(org, kind="meeting", target_id=meeting, erasure_id=erasure_id)
     assert await handle_erasure_event(session_factory, redis_client, event) == "applied"
 
-    assert await _rows(session_factory, org) == [(kept_meeting, "1", "c other meeting")]
-    assert await _rows(session_factory, other_org) == [
+    assert await _rows(owner_session_factory, org) == [(kept_meeting, "1", "c other meeting")]
+    assert await _rows(owner_session_factory, other_org) == [
         (meeting, "1", "d other org, same meeting id")
     ]
 
-    [(key, subject, partition_key, payload)] = await _completions(session_factory, org)
+    [(key, subject, partition_key, payload)] = await _completions(owner_session_factory, org)
     assert key == f"{COMPLETED}:{erasure_id}:{STORE}"
     assert subject == "admin-events-value" and partition_key == org
     assert payload["event_type"] == COMPLETED
@@ -223,60 +226,64 @@ async def test_meeting_erasure_deletes_only_that_meetings_rows_and_records_compl
         "counts": {"deleted": 2},
     }
     _encodes_against_v2(payload)
-    assert await _completions(session_factory, other_org) == []
+    assert await _completions(owner_session_factory, other_org) == []
 
 
 async def test_the_same_event_twice_is_a_no_op_with_and_without_the_redis_mark(
-    session_factory, redis_client, tenant
+    session_factory, owner_session_factory, redis_client, tenant
 ):
     org, meeting = tenant["org_id"], tenant["meeting_id"]
-    await _chunk(session_factory, org, meeting, "1", "gone")
+    await _chunk(owner_session_factory, org, meeting, "1", "gone")
     event = _event(org, kind="meeting", target_id=meeting)
     assert await handle_erasure_event(session_factory, redis_client, event) == "applied"
 
     # Rows written later for the same meeting must not be touched by a redelivery.
-    await _chunk(session_factory, org, meeting, "1", "written after")
+    await _chunk(owner_session_factory, org, meeting, "1", "written after")
     assert await handle_erasure_event(session_factory, redis_client, event) == "duplicate"
 
     await redis_client.delete(dedupe_key(org, event["header"]["idempotency_key"]))
     assert await handle_erasure_event(session_factory, redis_client, event) == "duplicate"
 
-    assert [r[2] for r in await _rows(session_factory, org)] == ["written after"]
-    assert len(await _completions(session_factory, org)) == 1
+    assert [r[2] for r in await _rows(owner_session_factory, org)] == ["written after"]
+    assert len(await _completions(owner_session_factory, org)) == 1
 
 
 async def test_person_erasure_removes_their_attribution_and_keeps_the_words(
-    session_factory, redis_client, tenant, other_org
+    session_factory, owner_session_factory, redis_client, tenant, other_org
 ):
     org, meeting = tenant["org_id"], tenant["meeting_id"]
     person, colleague = str(uuid.uuid4()), str(uuid.uuid4())
-    await _chunk(session_factory, org, meeting, person, "a their line")
-    await _chunk(session_factory, org, str(uuid.uuid4()), person.upper(), "b their other line")
-    await _chunk(session_factory, org, meeting, colleague, "c colleague")
-    await _chunk(session_factory, org, meeting, "1", "d diarized")
-    await _chunk(session_factory, other_org, meeting, person, "e other org")
+    await _chunk(owner_session_factory, org, meeting, person, "a their line")
+    await _chunk(
+        owner_session_factory, org, str(uuid.uuid4()), person.upper(), "b their other line"
+    )
+    await _chunk(owner_session_factory, org, meeting, colleague, "c colleague")
+    await _chunk(owner_session_factory, org, meeting, "1", "d diarized")
+    await _chunk(owner_session_factory, other_org, meeting, person, "e other org")
 
     event = _event(org, kind="person", target_id=person)
     assert await handle_erasure_event(session_factory, redis_client, event) == "applied"
 
-    rows = await _rows(session_factory, org)
+    rows = await _rows(owner_session_factory, org)
     assert [(r[1], r[2]) for r in rows] == [
         (ERASED_SPEAKER, "a their line"),
         (ERASED_SPEAKER, "b their other line"),
         (colleague, "c colleague"),
         ("1", "d diarized"),
     ]
-    assert [r[1] for r in await _rows(session_factory, other_org)] == [person]
-    [(_, _, _, payload)] = await _completions(session_factory, org)
+    assert [r[1] for r in await _rows(owner_session_factory, other_org)] == [person]
+    [(_, _, _, payload)] = await _completions(owner_session_factory, org)
     assert json.loads(payload["detail_json"])["counts"] == {"anonymized": 2}
     assert payload["target_type"] == "person" and payload["target_id"] == person
     _encodes_against_v2(payload)
 
     assert await handle_erasure_event(session_factory, redis_client, event) == "duplicate"
-    assert len(await _completions(session_factory, org)) == 1
+    assert len(await _completions(owner_session_factory, org)) == 1
 
 
-async def test_other_admin_events_are_ignored(session_factory, redis_client, tenant):
+async def test_other_admin_events_are_ignored(
+    session_factory, owner_session_factory, redis_client, tenant
+):
     org = tenant["org_id"]
     for event in (
         _event(org, kind="meeting", target_id=str(uuid.uuid4()), event_type="flag_changed"),
@@ -284,10 +291,12 @@ async def test_other_admin_events_are_ignored(session_factory, redis_client, ten
         _event(org, kind="meeting", target_id=str(uuid.uuid4()), event_type=COMPLETED),
     ):
         assert await handle_erasure_event(session_factory, redis_client, event) == "ignored"
-    assert await _completions(session_factory, org) == []
+    assert await _completions(owner_session_factory, org) == []
 
 
-async def test_an_unusable_event_is_dead_lettered(session_factory, redis_client, tenant):
+async def test_an_unusable_event_is_dead_lettered(
+    session_factory, owner_session_factory, redis_client, tenant
+):
     dlq = _Dlq()
     bad_target = _event(tenant["org_id"], kind="meeting", target_id="not-a-uuid")
     no_org = _event(tenant["org_id"], kind="meeting", target_id=str(uuid.uuid4()))
@@ -316,10 +325,10 @@ class _Flaky:
 
 
 async def test_a_transient_failure_is_retried_and_leaves_no_dedupe_mark(
-    session_factory, redis_client, tenant
+    session_factory, owner_session_factory, redis_client, tenant
 ):
     org, meeting = tenant["org_id"], tenant["meeting_id"]
-    await _chunk(session_factory, org, meeting, "1", "gone")
+    await _chunk(owner_session_factory, org, meeting, "1", "gone")
     event = _event(org, kind="meeting", target_id=meeting)
     flaky = _Flaky(session_factory, failures=2)
     outcome = await process_decoded_message(
@@ -332,7 +341,7 @@ async def test_a_transient_failure_is_retried_and_leaves_no_dedupe_mark(
         sleep=_no_sleep,
     )
     assert outcome == "applied" and flaky.calls == 3
-    assert await _rows(session_factory, org) == []
+    assert await _rows(owner_session_factory, org) == []
 
     always = _Flaky(session_factory, failures=99)
     dlq = _Dlq()

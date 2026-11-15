@@ -25,7 +25,10 @@ from transcription_service.sessions import SessionTracker
 
 @pytest.mark.asyncio
 async def test_second_join_does_not_open_a_second_meeting_session(
-    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    redis_client,
+    tenant: dict[str, str],
 ) -> None:
     org_id, meeting_id = tenant["org_id"], tenant["meeting_id"]
     provider = FakeProvider(script=[])
@@ -41,7 +44,10 @@ async def test_second_join_does_not_open_a_second_meeting_session(
 
 @pytest.mark.asyncio
 async def test_hinted_session_closes_only_on_last_leave(
-    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    redis_client,
+    tenant: dict[str, str],
 ) -> None:
     org_id, meeting_id = tenant["org_id"], tenant["meeting_id"]
     tracker = SessionTracker(
@@ -63,7 +69,10 @@ async def test_hinted_session_closes_only_on_last_leave(
 
 @pytest.mark.asyncio
 async def test_participant_finals_persist_exactly_once_attributed_to_the_participant(
-    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    redis_client,
+    tenant: dict[str, str],
 ) -> None:
     org_id, meeting_id = tenant["org_id"], tenant["meeting_id"]
     chunk_id = str(uuid.uuid4())
@@ -86,7 +95,7 @@ async def test_participant_finals_persist_exactly_once_attributed_to_the_partici
     await asyncio.sleep(0.2)  # let the background pump drain the (short) scripted stream
     assert await tracker.detach_participant(lease) is True, "last connection closes the meeting"
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         rows = (
             await session.execute(
                 text("SELECT speaker_id FROM transcript_chunks WHERE id = :id"), {"id": chunk_id}
@@ -97,7 +106,10 @@ async def test_participant_finals_persist_exactly_once_attributed_to_the_partici
 
 @pytest.mark.asyncio
 async def test_default_script_persists_through_the_real_pipeline(
-    session_factory: async_sessionmaker[AsyncSession], redis_client, tenant: dict[str, str]
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    redis_client,
+    tenant: dict[str, str],
 ) -> None:
     """Fix round 1, item 1: `FakeProvider()` with NO script override (what
     `select_provider()` returns under the dev flag) driven unmodified through a participant
@@ -112,7 +124,7 @@ async def test_default_script_persists_through_the_real_pipeline(
     await asyncio.sleep(0.2)
     await tracker.detach_participant(lease)
 
-    async with session_factory() as session:
+    async with owner_session_factory() as session:
         row = (
             (
                 await session.execute(

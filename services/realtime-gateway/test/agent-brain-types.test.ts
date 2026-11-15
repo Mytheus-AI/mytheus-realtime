@@ -274,9 +274,12 @@ describe("C7 alerts through the priority queue (real Redis)", () => {
     const recipient = randomUUID();
     const ad = payloadOf(alreadyDecided());
     const tw = payloadOf(topicWatch());
-    await enqueueAlert(redis, org, recipient, tw);
-    await enqueueAlert(redis, org, recipient, ad);
-    const drained = await drainAlerts(redis, org, recipient, meeting);
+    // "now" = just after the fixtures' createdAt, so the test does not expire as the calendar
+    // moves past ALERT_MAX_AGE_MS (enqueue and drain both purge by age).
+    const now = Date.parse("2026-11-10T10:01:00.000Z");
+    await enqueueAlert(redis, org, recipient, tw, now);
+    await enqueueAlert(redis, org, recipient, ad, now);
+    const drained = await drainAlerts(redis, org, recipient, meeting, now);
     expect(drained).toEqual([ad, tw]); // priority 2 before priority 3
   });
 });
