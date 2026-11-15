@@ -1,0 +1,178 @@
+name: test
+
+# mytheus-realtime had no test CI (journal plan Part 3 fix 8); only images.yml built containers.
+# Two jobs, one per stack:
+#
+#   gateway        realtime-gateway (Node): ESLint + Prettier, tsc, build, vitest.
+#   transcription  transcription-service (Python): ruff, black, mypy, and pytest against real
+#                  engines. Its tables live in the shared database next to mytheus-backend's
+#                  (organizations, outbox, tenant_settings, audit_logs...), so the job applies
+#                  mytheus-backend's migrations first, then this service's, on the PRODUCTION
+#                  image supabase/postgres:15.8.1.060 bootstrapped as production is. The service
+#                  code under test connects as its least-privilege role `mytheus_transcription`;
+#                  only fixtures use the schema owner (tests/conftest.py).
+#
+# Ports match tests/conftest.py's local defaults (5443, 6390, 9092).
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    # The fan-out tests are real-engine tests (cross-pod Redis pub/sub, Kafka consumers).
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6390
+      REDPANDA_BROKERS: localhost:9092
+      SCHEMA_REGISTRY_URL: http://localhost:8081
+    steps:
+      - uses: actions/checkout@v4
+      - name: start Redpanda with a Schema Registry, topics and subjects
+        run: |
+          docker run -d --name redpanda -p 9092:9092 -p 8081:8081 \
+            redpandadata/redpanda:v24.1.1 redpanda start --smp 1 --memory 1G --overprovisioned \
+            --node-id 0 --check=false --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+            --advertise-kafka-addr PLAINTEXT://localhost:9092 --schema-registry-addr 0.0.0.0:8081
+          for i in $(seq 1 60); do curl -sf localhost:8081/subjects >/dev/null && break; sleep 2; done
+          git clone --depth 1 https://github.com/Mytheus-AI/mytheus-events.git _events
+          sed 's/-p "\$2"/-p 1/' _events/scripts/create_topics.sh > /tmp/create_topics.sh
+          docker cp /tmp/create_topics.sh redpanda:/tmp/create_topics.sh
+          docker exec redpanda bash /tmp/create_topics.sh
+      - uses: astral-sh/setup-uv@v3
+      - name: register mytheus-events subjects
+        working-directory: _events
+        run: uv sync && make register SR_URL=http://localhost:8081
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+        working-directory: libs
+      - run: npm ci
+        working-directory: services/realtime-gateway
+      - run: npm run lint
+        working-directory: services/realtime-gateway
+      - run: npm run typecheck
+        working-directory: services/realtime-gateway
+      - run: npm run build && npm test
+        working-directory: services/realtime-gateway
+
+  transcription-lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/transcription-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run black --check .
+      - run: uv run mypy .
+
+  transcription:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: supabase/postgres:15.8.1.060
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mytheus
+        ports:
+          - 5443:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -h localhost"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 40
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_BOOTSTRAP_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5443/mytheus
+      TEST_REDIS_URL: redis://localhost:6390
+      TEST_REDPANDA_BROKERS: localhost:9092
+      TEST_SCHEMA_REGISTRY_URL: http://localhost:8081
+    steps:
+      - uses: actions/checkout@v4
+      - name: check out mytheus-backend (the shared schema) and mytheus-events (subjects)
+        run: |
+          git clone --depth 1 https://github.com/Mytheus-AI/mytheus-backend.git _backend
+          git clone --depth 1 https://github.com/Mytheus-AI/mytheus-events.git _events
+      - uses: astral-sh/setup-uv@v3
+
+      - name: start Redpanda with a Schema Registry
+        run: |
+          docker run -d --name redpanda -p 9092:9092 -p 8081:8081 \
+            redpandadata/redpanda:v24.1.1 redpanda start --smp 1 --memory 1G --overprovisioned \
+            --node-id 0 --check=false --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+            --advertise-kafka-addr PLAINTEXT://localhost:9092 --schema-registry-addr 0.0.0.0:8081
+          for i in $(seq 1 60); do curl -sf localhost:8081/subjects >/dev/null && break; sleep 2; done
+
+      - name: topics (one partition each) and mytheus-events subjects
+        working-directory: _events
+        run: |
+          sed 's/-p "\$2"/-p 1/' scripts/create_topics.sh > /tmp/create_topics.sh
+          docker cp /tmp/create_topics.sh redpanda:/tmp/create_topics.sh
+          docker exec redpanda bash /tmp/create_topics.sh
+          uv sync
+          make register SR_URL=http://localhost:8081
+
+      - name: bootstrap the production image as production does
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for i in $(seq 1 30); do
+            psql -h localhost -p 5443 -U supabase_admin -d mytheus -c "select 1" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          psql -v ON_ERROR_STOP=1 -h localhost -p 5443 -U supabase_admin -d mytheus \
+            -c "ALTER USER postgres WITH PASSWORD 'postgres';" \
+            -c "ALTER SCHEMA public OWNER TO postgres;" \
+            -c "GRANT ALL ON SCHEMA public TO postgres;"
+
+      - name: mytheus-backend migrations, then this service's
+        env:
+          BOOTSTRAP_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5443/mytheus
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5443/mytheus
+          MYTHEUS_APP_PASSWORD: mytheus_app
+          MYTHEUS_RELAY_PASSWORD: mytheus_relay
+          MYTHEUS_ADMIN_PASSWORD: mytheus_admin
+        run: |
+          (cd _backend && uv sync && uv run alembic -c migrations/alembic.ini upgrade head \
+            && uv run python -m scripts.bootstrap_roles)
+          cd services/transcription-service && uv sync && uv run alembic upgrade head
+
+      - name: pytest
+        working-directory: services/transcription-service
+        run: uv run pytest -q -rs
+
+      - name: assert the isolation and least-privilege tests actually executed
+        working-directory: services/transcription-service
+        run: |
+          uv run pytest -q --no-header \
+            tests/test_rls_isolation.py \
+            tests/test_db_role_guard.py \
+            tests/test_partition_privileges.py \
+            | tee /tmp/isolation.txt
+          if grep -qE "[0-9]+ (failed|skipped|error)" /tmp/isolation.txt; then
+            echo "::error::an isolation test failed or skipped"; exit 1
+          fi
+          grep -qE "[0-9]+ passed" /tmp/isolation.txt
