@@ -51,6 +51,8 @@ jobs:
           docker cp /tmp/create_topics.sh redpanda:/tmp/create_topics.sh
           docker exec redpanda bash /tmp/create_topics.sh
       - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
       - name: register mytheus-events subjects
         working-directory: _events
         run: uv sync && make register SR_URL=http://localhost:8081
@@ -76,6 +78,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
       - run: uv sync
       - run: uv run ruff check .
       - run: uv run black --check .
@@ -117,6 +121,8 @@ jobs:
           git clone --depth 1 https://github.com/Mytheus-AI/mytheus-backend.git _backend
           git clone --depth 1 https://github.com/Mytheus-AI/mytheus-events.git _events
       - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
 
       - name: start Redpanda with a Schema Registry
         run: |
