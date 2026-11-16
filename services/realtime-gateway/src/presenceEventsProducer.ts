@@ -49,6 +49,7 @@ import { randomUUID } from "node:crypto";
 
 import { SchemaRegistry } from "@kafkajs/confluent-schema-registry";
 import { Kafka, Partitioners } from "kafkajs";
+import { kafkaSasl, registryAuth } from "./kafkaAuth.js";
 
 import { buildDlqEnvelope, buildEnvelopeHeader } from "../../../libs/envelope";
 
@@ -132,6 +133,7 @@ export function createPresenceEventsProducer(
   const kafka = new Kafka({
     clientId: options.clientId ?? "realtime-gateway",
     brokers: options.brokers,
+    sasl: kafkaSasl(),
   });
   const producer: MinimalKafkaProducer =
     options.producer ??
@@ -141,7 +143,8 @@ export function createPresenceEventsProducer(
       retry: { retries: PRODUCE_RETRIES },
     });
   const registry: MinimalSchemaRegistry =
-    options.registry ?? new SchemaRegistry({ host: options.schemaRegistryUrl });
+    options.registry ??
+    new SchemaRegistry({ host: options.schemaRegistryUrl, auth: registryAuth() });
 
   let schemaId: number | undefined;
   let connected = false;
