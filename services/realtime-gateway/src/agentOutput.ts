@@ -111,6 +111,7 @@
  */
 import { SchemaRegistry } from "@kafkajs/confluent-schema-registry";
 import { Kafka, type Consumer } from "kafkajs";
+import { kafkaSasl, registryAuth } from "./kafkaAuth.js";
 import type { Logger } from "pino";
 
 import { pubsubChannel } from "../../../libs/keys";
@@ -1016,8 +1017,12 @@ export function createAgentOutputConsumer(params: {
   onAlert?: (routed: RoutedAgentMessage) => Promise<void>;
   logger: Logger;
 }): AgentOutputConsumer {
-  const kafka = new Kafka({ clientId: "realtime-gateway", brokers: params.brokers });
-  const registry = new SchemaRegistry({ host: params.schemaRegistryUrl });
+  const kafka = new Kafka({
+    clientId: "realtime-gateway",
+    brokers: params.brokers,
+    sasl: kafkaSasl(),
+  });
+  const registry = new SchemaRegistry({ host: params.schemaRegistryUrl, auth: registryAuth() });
   let consumer: Consumer | undefined;
 
   return {

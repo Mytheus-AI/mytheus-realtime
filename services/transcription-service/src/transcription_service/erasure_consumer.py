@@ -62,6 +62,8 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from transcription_service.kafka_auth import kafka_conf, registry_conf
+
 from .db import tenant_transaction
 from .events import build_envelope_header
 from .outbox import enqueue
@@ -348,18 +350,22 @@ async def run_consumer(
 
     loop = asyncio.get_running_loop()
     consumer = Consumer(
-        {
-            "bootstrap.servers": brokers,
-            "group.id": CONSUMER_GROUP,
-            "enable.auto.commit": False,
-            "auto.offset.reset": "earliest",
-        }
+        kafka_conf(
+            {
+                "bootstrap.servers": brokers,
+                "group.id": CONSUMER_GROUP,
+                "enable.auto.commit": False,
+                "auto.offset.reset": "earliest",
+            }
+        )
     )
     consumer.subscribe([TOPIC])
     dlq_producer = KafkaProducer(
-        {"bootstrap.servers": brokers, "acks": "all", "enable.idempotence": True}
+        kafka_conf({"bootstrap.servers": brokers, "acks": "all", "enable.idempotence": True})
     )
-    deserializer = AvroDeserializer(SchemaRegistryClient({"url": schema_registry_url}))
+    deserializer = AvroDeserializer(
+        SchemaRegistryClient(registry_conf({"url": schema_registry_url}))
+    )
     try:
         while stop is None or not stop.is_set():
             msg = await loop.run_in_executor(None, consumer.poll, _POLL_TIMEOUT_SECONDS)
